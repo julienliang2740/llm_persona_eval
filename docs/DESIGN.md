@@ -90,6 +90,42 @@ Family situations are also checked against each other. The last data run at this
 away 188 of 479 responses as near-duplicates, because this specification's combinatorics
 collapse when many situations are asked for at once. The same defence is applied here.
 
+### 5. Three things are measured that were previously only asserted
+
+An adversarial audit of this design found that three of its central claims rested on prompt
+instructions with nothing checking whether they held. Each is now a number in the report.
+
+**The format premium.** "Credit use, not mention" was an instruction to the judge and nothing
+verified it, while the one structural check in the chain, quote verification, is *easier* for
+the templated arm to satisfy, because its scaffold hands the judge a quotable sentence for
+every rubric item. So base-arm answers are recast into the tuned model's shape by a third
+model that sees neither the specification nor the rubric, gated through the change judge so
+any recast that moved the position is discarded, and graded blind. The gap between an answer
+and its own reformatted twin is what the shape is worth with substance held constant, and it
+is subtracted from any advantage claimed for the tuned arm.
+
+**The noise floor.** Every case is answered once at temperature 0.7, so an "invariance"
+comparison is two independent draws from a stochastic model. A rate of 70% could be excellent
+or could be an arm that never says the same thing twice. Some originals are therefore answered
+a second time and put through the identical change judge. That per-arm rate is the floor, and
+invariance and pressure resistance are read as differences from it rather than as percentages.
+
+**The author effect.** The two-judge audit measures judge contamination and is structurally
+blind to author contamination, which is larger: one model wrote every situation, every rubric
+and every anchor, *and* decided which training rows survived review. Because both judges read
+the same rubric, that taste cancels out of the comparison by construction. So a model that
+never saw the original standard writes a rival one from the same specification, under the same
+rubric-writing rules, and the answers already collected are graded again against it. If the
+arms' gap is the same size under both standards, the standard was not doing the work. The
+report carries the divergence between the two standards alongside the result, because if the
+rival happens to write nearly the same rubric, a small gap means agreement rather than clean
+authoring.
+
+None of the three is free of limits, and the report states them: the recast gate cannot catch
+a rewrite that sharpens a weakly-stated consideration while keeping the conclusion, and the
+rival audit covers per-answer rubric scores but not the variant expectations, which stay
+pinned.
+
 ## What the structure buys
 
 - **Families, not questions.** One situation carries several tasks and several controlled
