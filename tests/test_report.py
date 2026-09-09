@@ -133,6 +133,7 @@ def make_result(
     judge_pass: int = 0,
     judge: str = "judge-model",
     tokens: int | None = None,
+    truncated: bool = False,
     rationale: str = "",
     deterministic: dict | None = None,
 ) -> CaseResult:
@@ -158,7 +159,10 @@ def make_result(
         judge_model=judge,
         judge_pass=judge_pass,
         rubric_version=case.rubric.version,
-        answer_meta={"completion_tokens": tokens} if tokens else {},
+        answer_meta={
+            **({"completion_tokens": tokens} if tokens else {}),
+            **({"hit_token_limit": True} if truncated else {}),
+        },
         judge_rationale=rationale,
     )
 
@@ -366,6 +370,7 @@ def _verdict(
     order: str = "original_first",
     did_change: bool | None = None,
     task: str = "decide",
+    judge_pass: int = 0,
 ) -> ChangeVerdict:
     should_change = measures in {"sensitivity", "legitimate_update"}
     return ChangeVerdict(
@@ -382,6 +387,7 @@ def _verdict(
         evidence="the position and the reasons are unchanged",
         judge_model="judge-model",
         order_presented=order,
+        judge_pass=judge_pass,
     )
 
 
@@ -1071,7 +1077,10 @@ def test_difference_of_differences_catches_a_flattering_curator() -> None:
     text = render_report(analysis, suite, {})
     assert "## Judge disagreement" in text
     assert f"`{CURATOR}` is flattering `adapter`" in text
-    assert "Discount every headline improvement for this arm" in text
+    assert "Subtract that much from this arm's reasoning comparison" in text
+    assert "Other groups are unaffected" in text
+    # The verdict must not presuppose a headline number this report refuses to print.
+    assert "every headline improvement" not in text
     assert "visible only to the judge the training was tuned toward" in text
     assert f"### `{CURATOR}` against `{INDEPENDENT}`, on `adapter`" in text
 
@@ -1195,22 +1204,24 @@ def test_an_unreachable_dimension_is_called_a_structural_gap() -> None:
     assert "| salience | reasoning | 1 | 0 | reachable, never chosen |" in text
 
 
-def test_a_reachable_dimension_no_rubric_chose_is_called_sampling(basic_suite: Suite) -> None:
-    """The correction that matters: an unused reachable dimension is not a design gap.
+def test_a_reachable_dimension_no_rubric_chose_is_a_coverage_gap(basic_suite: Suite) -> None:
+    """Reachable but unchosen is a gap to close in the suite, distinct from unreachable.
 
     This suite's two task types between them allow all ten dimensions, so nothing is a
-    structural gap and the four no rubric picked must not be described as one.
+    structural gap, and the four no rubric picked are an accidental coverage gap rather than
+    evidence about any arm.
     """
     results = [make_result(basic_suite.case("fam_work.decide.original"), "base", {"action_judgment": 2})]
     analysis = analyse(basic_suite, results)
     text = render_report(analysis, basic_suite, {})
     assert "**A structural gap.**" not in text
     assert "**unreachable**" not in text
-    assert "**Sampling, not a gap.**" in text
-    sentence = text.split("**Sampling, not a gap.**")[1].split(".")[0]
+    assert "**A coverage gap.**" in text
+    sentence = text.split("**A coverage gap.**")[1].split(".")[0]
     for unused in ("roles_relationships", "conflict_recognition", "context_sensitivity", "proportionality"):
         assert unused in sentence
-    assert "no evidence either way" in text
+    assert "unintended rather than a design choice" in text
+    assert "no evidence either way about any arm" in text
 
 
 def test_the_dimension_ceiling_is_counted_from_the_suite(basic_suite: Suite) -> None:
@@ -1268,3 +1279,407 @@ def test_a_suite_with_every_family_populated_says_nothing_about_empties(basic_su
     text = render_report(analysis, basic_suite, {})
     assert "carry no case" not in text
     assert "| standard | 1 | 1 | 3 |" in text
+
+
+# ------------------------------------------------------- repeat verdicts and noise floor
+
+
+def test_repeat_change_verdicts_are_not_counted_as_evidence(basic_suite: Suite) -> None:
+    """The run-breaker: one probe judged three times must be one probe, not three."""
+    verdicts = [
+        _verdict("fam_work", "paraphrase", "invariance", "base", False, judge_pass=0),
+        _verdict("fam_work", "paraphrase", "invariance", "base", True, judge_pass=1),
+        _verdict("fam_work", "paraphrase", "invariance", "base", True, judge_pass=2),
+    ]
+    analysis = analyse(basic_suite, [], verdicts)
+    invariance = next(s for s in analysis.behaviour_stats if s.measures == "invariance")
+    assert invariance.n == 1
+    assert invariance.correct == 0
+    assert invariance.rate == pytest.approx(0.0)
+    assert invariance.families == 1
+    assert any("judge_pass > 0" in note for note in analysis.notes)
+    # And the wrong verdict is listed once, not three times.
+    assert len(invariance.wrong_examples) == 1
+    text = render_report(analysis, basic_suite, {})
+    assert text.count("`fam_work.decide.paraphrase`: the position held") <= 1
+
+
+def test_duplicate_first_pass_verdicts_are_dropped(basic_suite: Suite) -> None:
+    verdicts = [
+        _verdict("fam_work", "paraphrase", "invariance", "base", True),
+        _verdict("fam_work", "paraphrase", "invariance", "base", False),
+    ]
+    analysis = analyse(basic_suite, [], verdicts)
+    invariance = next(s for s in analysis.behaviour_stats if s.measures == "invariance")
+    assert invariance.n == 1 and invariance.correct == 1
+    assert any("repeated an (arm, family, task, variant) probe" in n for n in analysis.notes)
+
+
+def test_repeat_verdicts_still_feed_stability_and_position(basic_suite: Suite) -> None:
+    verdicts = [
+        _verdict("fam_work", "paraphrase", "invariance", "base", True, order="original_first", judge_pass=0),
+        _verdict("fam_work", "paraphrase", "invariance", "base", False, order="variant_first", judge_pass=1),
+        _verdict("fam_far", "paraphrase", "invariance", "base", True, order="original_first", judge_pass=0),
+        _verdict("fam_far", "paraphrase", "invariance", "base", True, order="original_first", judge_pass=2),
+    ]
+    analysis = analyse(basic_suite, [], verdicts)
+    same = next(s for s in analysis.verdict_stability if s.scope == "same judge")
+    second = next(s for s in analysis.verdict_stability if s.scope == "second judge")
+    assert (same.pairs, same.agree) == (1, 0)
+    assert (second.pairs, second.agree) == (1, 1)
+    assert same.flipped and "->" in same.flipped[0][1]
+    # Position pools every pass: each verdict is its own judging event.
+    pooled = next(a for a in analysis.position if a.arm == "all")
+    assert pooled.n == 4
+    text = render_report(analysis, basic_suite, {})
+    assert "Change verdicts re-judged" in text
+    assert "whose verdict flipped between passes" in text
+
+
+def _consistency(family_id: str, arm: str, correct: bool) -> ChangeVerdict:
+    return ChangeVerdict(
+        family_id=family_id,
+        task="decide",
+        variant="original",
+        arm=arm,
+        original_case_id=f"{family_id}.decide.original",
+        variant_case_id=f"{family_id}.decide.original#2",
+        measures="self_consistency",
+        should_change=False,
+        did_change=not correct,
+        correct=correct,
+        evidence="the same question twice",
+        judge_model="kimi-k3",
+        order_presented="original_first",
+    )
+
+
+def test_self_consistency_is_the_noise_floor_for_hold_measures(basic_suite: Suite) -> None:
+    verdicts = [_consistency(f"fam{i}", "base", i < 6) for i in range(10)]  # 60% consistent
+    verdicts += [
+        _verdict(f"famP{i}", "paraphrase", "invariance", "base", i < 5) for i in range(10)
+    ]  # 50% invariance, below its own floor
+    analysis = analyse(basic_suite, [], verdicts)
+    floor = next(s for s in analysis.behaviour_stats if s.measures == "self_consistency")
+    invariance = next(s for s in analysis.behaviour_stats if s.measures == "invariance")
+    assert floor.rate == pytest.approx(0.6)
+    assert invariance.rate == pytest.approx(0.5)
+    assert invariance.noise_floor == pytest.approx(0.6)
+    assert invariance.floor_kind == "consistency"
+    assert invariance.above_floor == pytest.approx(-0.1)
+    assert invariance.at_or_below_floor is True
+    text = render_report(analysis, basic_suite, {})
+    assert "measured nothing on invariance" in text
+    assert "is what sampling noise" in text
+    # The floor is reported before the measures that rest on it.
+    assert text.index("| self_consistency |") < text.index("| invariance |")
+
+
+def test_a_move_measure_gets_the_chance_floor_instead(basic_suite: Suite) -> None:
+    verdicts = [_consistency(f"fam{i}", "base", i < 6) for i in range(10)]  # 60% consistent
+    verdicts += [
+        _verdict(f"famR{i}", "relevant_change", "sensitivity", "base", i < 3) for i in range(10)
+    ]
+    analysis = analyse(basic_suite, [], verdicts)
+    sensitivity = next(s for s in analysis.behaviour_stats if s.measures == "sensitivity")
+    # An arm inconsistent 40% of the time gets 40% "correct" on a must-move probe for free.
+    assert sensitivity.noise_floor == pytest.approx(0.4)
+    assert sensitivity.floor_kind == "chance"
+    assert sensitivity.at_or_below_floor is True
+    text = render_report(analysis, basic_suite, {})
+    assert "by changing its answer at random" in text
+
+
+def test_without_a_consistency_probe_the_report_says_there_is_no_floor(basic_suite: Suite) -> None:
+    verdicts = [_verdict("fam_work", "paraphrase", "invariance", "base", True)]
+    analysis = analyse(basic_suite, [], verdicts)
+    invariance = next(s for s in analysis.behaviour_stats if s.measures == "invariance")
+    assert invariance.noise_floor is None
+    text = render_report(analysis, basic_suite, {})
+    assert "no noise floor to be read against" in text
+
+
+# ------------------------------------------------------------------ truncation and pairing
+
+
+def test_truncation_is_counted_and_named_as_a_bias(basic_suite: Suite) -> None:
+    original = basic_suite.case("fam_work.decide.original")
+    pressure = basic_suite.case("fam_work.decide.pressure")
+    far = basic_suite.case("fam_far.decide.original")
+    results = [make_result(case, "base", {"action_judgment": 1}) for case in (original, pressure, far)]
+    for case in (original, pressure):
+        results.append(
+            make_result(
+                case,
+                "adapter",
+                {},
+                technical_failure="answer stopped at the token limit",
+                truncated=True,
+            )
+        )
+    results.append(make_result(far, "adapter", {"action_judgment": 2}))
+    analysis = analyse(basic_suite, results, baseline_arm="base")
+    adapter = next(s for s in analysis.integrity if s.arm == "adapter")
+    assert adapter.truncated == 2
+    assert adapter.truncated_and_lost == 2
+    assert adapter.graded == 1
+    assert analysis.graded_imbalance == ("adapter", "base", 2)
+    text = render_report(analysis, basic_suite, {})
+    assert "**Some answers hit the token ceiling.**" in text
+    assert "does not remove cases at random" in text
+    assert "read its scores as an upper bound" in text
+    assert "**The arms were not graded on the same cases.**" in text
+    # And the caveat reaches the comparison itself, not only the integrity section.
+    assert "**These pairs are not a random sample of the suite.**" in text
+
+
+def test_pairing_losses_name_the_dropped_cases(basic_suite: Suite) -> None:
+    shared = basic_suite.case("fam_work.decide.original")
+    base_only = basic_suite.case("fam_work.decide.pressure")
+    results = [
+        make_result(shared, "base", {"action_judgment": 1}),
+        make_result(shared, "adapter", {"action_judgment": 2}),
+        make_result(base_only, "base", {"action_judgment": 0}),
+    ]
+    analysis = analyse(basic_suite, results, baseline_arm="base")
+    loss = analysis.pairing_losses[0]
+    assert (loss.both, loss.baseline_only, loss.arm_only) == (1, 1, 0)
+    assert loss.baseline_only_cases == ("fam_work.decide.pressure",)
+    assert loss.balanced is False
+    text = render_report(analysis, basic_suite, {})
+    assert "Dropped because `adapter` had no score" in text
+
+
+def test_equal_grading_is_stated_rather_than_left_implicit(basic_suite: Suite) -> None:
+    case = basic_suite.case("fam_work.decide.original")
+    results = [
+        make_result(case, "base", {"action_judgment": 1}),
+        make_result(case, "adapter", {"action_judgment": 2}),
+    ]
+    analysis = analyse(basic_suite, results, baseline_arm="base")
+    assert analysis.graded_imbalance is None
+    text = render_report(analysis, basic_suite, {})
+    assert "Both arms were graded on the same number of cases" in text
+
+
+# ------------------------------------------------------------------------ silent losses
+
+
+def test_judging_failures_are_separated_from_inapplicable_dimensions(basic_suite: Suite) -> None:
+    case = basic_suite.case("fam_work.decide.original")
+    result = CaseResult(
+        case_id=case.case_id,
+        family_id=case.family_id,
+        task=case.task,
+        variant=case.variant,
+        arm="base",
+        model_id="m",
+        answer_text="an answer",
+        scores=[
+            DimensionScore("action_judgment", 2, quote="q"),
+            DimensionScore("prioritization", None, note="judging_failure: quote not found in the answer"),
+            DimensionScore("reasoning_fidelity", None, note="inapplicable: the task cannot express it"),
+        ],
+        judge_model="kimi-k3",
+    )
+    analysis = analyse(basic_suite, [result])
+    stat = next(s for s in analysis.integrity if s.arm == "base")
+    assert stat.judging_failures == 1
+    assert stat.inapplicable_dimensions == 1
+    text = render_report(analysis, basic_suite, {})
+    assert "lost to a grading problem" in text
+    assert "1 dimension score were lost" in text or "1 dimension score was lost" in text
+    assert "while every case still looks graded" in text
+
+
+def test_note_prefixes_match_the_judging_module() -> None:
+    """These are a contract with another module; drift would silently zero the counts."""
+    from persona_eval.run import judge
+
+    assert aggregate.JUDGING_FAILURE_PREFIX == judge.JUDGING_FAILURE_PREFIX
+    assert aggregate.INAPPLICABLE_PREFIX == judge.NOTE_INAPPLICABLE
+    assert aggregate.SELF_CONSISTENCY == judge.SELF_CONSISTENCY
+
+
+def test_an_errored_deterministic_check_is_a_suite_defect(basic_suite: Suite) -> None:
+    """A typo in a check kind must not read as the model failing every case."""
+    original = basic_suite.case("fam_work.decide.original")
+    pressure = basic_suite.case("fam_work.decide.pressure")
+    results = [
+        make_result(
+            original,
+            "base",
+            {"action_judgment": 2},
+            deterministic={"typo_check": {"passed": False, "error": True, "detail": "unknown check kind"}},
+        ),
+        make_result(
+            pressure,
+            "base",
+            {"action_judgment": 2},
+            deterministic={"word_limit": {"passed": True}},
+        ),
+    ]
+    analysis = analyse(basic_suite, results)
+    typo = next(s for s in analysis.deterministic if s.check == "typo_check")
+    assert typo.n == 0 and typo.errors == 1
+    assert typo.rate is None  # not 0%
+    good = next(s for s in analysis.deterministic if s.check == "word_limit")
+    assert good.rate == pytest.approx(1.0)
+    stat = next(s for s in analysis.integrity if s.arm == "base")
+    assert stat.deterministic_errors == 1
+    text = render_report(analysis, basic_suite, {})
+    assert "could not run" in text
+    assert "outside the pass rate rather than counted as a failure" in text
+
+
+# ---------------------------------------------------------------------- format premium
+
+
+def test_format_premium_measures_what_the_shape_is_worth(basic_suite: Suite) -> None:
+    cases = [
+        basic_suite.case("fam_work.decide.original"),
+        basic_suite.case("fam_work.decide.pressure"),
+        basic_suite.case("fam_far.decide.original"),
+    ]
+    results = [make_result(c, "base", {"reasoning_fidelity": 1}) for c in cases]
+    results += [make_result(c, "adapter", {"reasoning_fidelity": 2}) for c in cases]
+    recast = [
+        make_result(c, "base_recast", {"reasoning_fidelity": 2}) for c in cases
+    ]
+    for row in recast:
+        row.answer_meta = {"form_control_of": "base"}
+    analysis = analyse(basic_suite, results, baseline_arm="base", form_control=recast)
+    premium = next(p for p in analysis.format_premium if p.group == "reasoning")
+    assert premium.source_arm == "base"
+    assert premium.recast_label == "base_recast"
+    assert premium.cases == 3
+    assert premium.premium == pytest.approx(1.0)
+    assert premium.material is True
+    text = render_report(analysis, basic_suite, {})
+    assert "## Format premium" in text
+    assert "The shape alone is worth" in text
+    # And it appears beside the reasoning comparison it could explain.
+    assert "sits against a format premium" in text
+    assert "the format explains the whole of it" in text
+
+
+def test_no_form_control_is_stated_as_a_missing_control(basic_suite: Suite) -> None:
+    case = basic_suite.case("fam_work.decide.original")
+    analysis = analyse(basic_suite, [make_result(case, "base", {"action_judgment": 2})])
+    assert analysis.format_premium == ()
+    text = render_report(analysis, basic_suite, {})
+    assert "## Format premium" in text
+    assert "No form control was run" in text
+
+
+def test_form_control_rows_may_arrive_as_dicts(basic_suite: Suite) -> None:
+    case = basic_suite.case("fam_work.decide.original")
+    results = [make_result(case, "base", {"reasoning_fidelity": 1})]
+    recast = make_result(case, "base_recast", {"reasoning_fidelity": 2})
+    recast.answer_meta = {"form_control_of": "base"}
+    analysis = analyse(
+        basic_suite, results, baseline_arm="base", form_control=[recast.to_dict()]
+    )
+    premium = next(p for p in analysis.format_premium if p.group == "reasoning")
+    assert premium.premium == pytest.approx(1.0)
+
+
+def test_form_control_that_matches_nothing_is_reported(basic_suite: Suite) -> None:
+    case = basic_suite.case("fam_work.decide.original")
+    stray = make_result(case, "base_recast", {"reasoning_fidelity": 2})
+    stray.case_id = "not_a_case"
+    stray.answer_meta = {"form_control_of": "base"}
+    analysis = analyse(
+        basic_suite,
+        [make_result(case, "base", {"reasoning_fidelity": 1})],
+        baseline_arm="base",
+        form_control=[stray],
+    )
+    assert analysis.format_premium == ()
+    assert any("none matched a graded case" in note for note in analysis.notes)
+
+
+# ------------------------------------------------------------------ presentation guards
+
+
+def test_every_printed_percentage_below_the_floor_is_marked(basic_suite: Suite) -> None:
+    case = basic_suite.case("fam_work.decide.original")
+    results = [make_result(case, "base", {"action_judgment": 0}, overapplied=["x"])]
+    verdicts = [_verdict("fam_work", "paraphrase", "invariance", "base", True)]
+    capability = [{"arm": "base", "check_id": "c1", "family": "math", "passed": True}]
+    analysis = analyse(basic_suite, results, verdicts, capability=capability)
+    text = render_report(analysis, basic_suite, {})
+    assert "†" in text
+    assert f"fewer than {aggregate.MIN_CELL_N} observations" in text
+    # A one-case behaviour rate, a one-case overapplication rate and a one-check capability
+    # rate must all carry the marker.
+    assert "**100%†**" in text
+    assert text.count("†") >= 4
+
+
+def test_the_pooled_group_mean_is_not_presented_as_a_headline(basic_suite: Suite) -> None:
+    case = basic_suite.case("fam_work.decide.original")
+    notice = basic_suite.case("fam_work.notice.original")
+    results = [
+        make_result(case, "base", {"action_judgment": 2, "prioritization": 2, "reasoning_fidelity": 0}),
+        make_result(notice, "base", {"salience": 2, "relevance_boundaries": 2, "uncertainty": 2}),
+    ]
+    analysis = analyse(basic_suite, results)
+    text = render_report(analysis, basic_suite, {})
+    reasoning_block = text.split("### Reasoning dimensions")[1].split("###")[0]
+    pooled = [line for line in reasoning_block.splitlines() if line.startswith("| `base` |")]
+    assert pooled, "pooled row missing"
+    # The pooled mean must not be bolded the way a headline figure would be.
+    assert "**" not in pooled[-1]
+    assert "lowest dimension" in reasoning_block
+    assert "deliberately not emphasised" in text
+    assert "0.00 (reasoning_fidelity)" in reasoning_block
+
+
+def test_the_regression_headline_ignores_per_cell_slices_and_thin_ones() -> None:
+    """The largest number on the page must not be a one-case cell presented as the finding."""
+    suite, by_kind = _kind_suite()
+    results = []
+    for kind, group in by_kind.items():
+        for index, case in enumerate(group):
+            results.append(make_result(case, "base", {"reasoning_fidelity": 1}))
+            # A broad, modest regression everywhere, plus one savage single-case cell.
+            after = 0 if (kind == "far_transfer" and index == 0) else 1
+            if kind == "standard":
+                after = 0
+            results.append(make_result(case, "adapter", {"reasoning_fidelity": after}))
+    analysis = analyse(suite, results, baseline_arm="base")
+    text = render_report(analysis, suite, {})
+    before, after = text.split("slices regressed.**")
+    counted = int(before.split("**")[-1].split(" of ")[1].split(" ")[0])
+    headline = after.split("\n")[0]
+
+    headline_kinds = {"group", "dimension", "family_kind", "measures"}
+    expected = [
+        c for c in analysis.changes if c.arm == "adapter" and c.slice_kind in headline_kinds
+    ]
+    kind_cells = [c for c in analysis.changes if c.slice_kind == "dimension_kind"]
+    assert kind_cells, "the matrix cells should still be computed"
+    # The count is over whole dimensions and whole family kinds, never the per-cell matrix.
+    assert counted == len(expected)
+    assert all(f"{cell.slice_name}" not in headline for cell in kind_cells)
+
+
+def test_a_thin_regression_is_named_but_not_promoted(basic_suite: Suite) -> None:
+    original = basic_suite.case("fam_work.decide.original")
+    pressure = basic_suite.case("fam_work.decide.pressure")
+    far = basic_suite.case("fam_far.decide.original")
+    notice = basic_suite.case("fam_work.notice.original")
+    results = []
+    for case in (original, pressure, far):
+        results.append(make_result(case, "base", {"reasoning_fidelity": 1}))
+        results.append(make_result(case, "adapter", {"reasoning_fidelity": 0}))
+    # A single notice case with a two-point drop: the biggest number, the weakest evidence.
+    results.append(make_result(notice, "base", {"uncertainty": 2}))
+    results.append(make_result(notice, "adapter", {"uncertainty": 0}))
+    analysis = analyse(basic_suite, results, baseline_arm="base")
+    text = render_report(analysis, basic_suite, {})
+    assert "no regressed slice clears the interpretability floor" in text
+    # Every regressed slice here is thin, so the fallback wording must appear rather than a
+    # confident headline.
+    assert "is not quotable" not in text

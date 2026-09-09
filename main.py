@@ -37,8 +37,6 @@ from typing import Any, Sequence
 from persona_eval import PIPELINE_ROOT
 from persona_eval import evaluate as legacy_evaluate
 from persona_eval import runs
-from persona_eval.report.aggregate import analyse
-from persona_eval.report.render import render_report
 from persona_eval.run.answer import answer_cases, settings_disagreement
 from persona_eval.run.judge import judge_cases, judge_changes
 from persona_eval.suite import io as suite_io
@@ -326,6 +324,12 @@ def _load_verdicts(directory: Path, arm: str) -> list[ChangeVerdict]:
 
 
 def cmd_report(args: argparse.Namespace) -> int:
+    # Imported here, not at module scope. Answering is the expensive, unrepeatable part of a
+    # run; rendering is cheap and can be redone at any time. A half-written reporting module
+    # must not be able to stop a run before it generates a single answer.
+    from persona_eval.report.aggregate import analyse
+    from persona_eval.report.render import render_report
+
     config = load_eval_config(args.config)
     directory = runs.run_dir(args.run)
     suite = suite_io.load_suite(directory / runs.SUITE_COPY)

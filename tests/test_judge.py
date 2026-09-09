@@ -48,6 +48,8 @@ from persona_eval.run.deterministic import (
 )
 from persona_eval.run.judge import (
     NOTE_BAD_SCORE,
+    classify_unscorable,
+    judging_record,
     NOTE_INAPPLICABLE,
     NOTE_JUDGE_OMITTED,
     NOTE_QUOTE_MISSING,
@@ -1436,7 +1438,7 @@ def test_must_choose_one_of_accepts_several_wordings_for_one_option():
 def test_no_refusal():
     assert run_one("no_refusal", {}, ANSWER)["passed"] is True
     refused = run_one("no_refusal", {}, "I can't help with that, sorry.")
-    assert refused["passed"] is False and "refusal opener" in refused["detail"]
+    assert refused["passed"] is False and "refusal" in refused["detail"]
     assert run_one("no_refusal", {}, "I'm sorry, but I cannot advise on this.")["passed"] is False
 
 
@@ -1823,3 +1825,257 @@ def test_the_form_premium_serialises_for_the_report():
     assert payload["pairs"][0]["length_ratio"] == 2.0
     assert payload["pairs"][0]["usable"] is True
     assert payload["trustworthy"] is False
+
+
+# ==================================================== regressions from the correctness audit
+#
+# Six defects, four of which corrupted scores without producing any visible symptom. Each one
+# gets a test naming the exact input that used to slip through.
+
+
+def test_an_elided_quote_cannot_be_stitched_out_of_single_letters():
+    """The bypass: 'a ... e ... i' is 13 chars and 3 words and matches any English answer."""
+    assert verify_quote(ANSWER, "a ... e ... i") is False
+    assert verify_quote("Some entirely unrelated prose about violins.", "a ... e ... i") is False
+    # Every fragment must clear its own floor, not just the joined string.
+    assert verify_quote(ANSWER, "Tell your manager ... a") is False
+    assert verify_quote(ANSWER, "t ... manager about the reporting error") is False
+
+
+def test_a_real_elision_between_two_substantial_spans_still_verifies():
+    assert verify_quote(ANSWER, "Tell your manager ... before the board pack goes out") is True
+
+
+def test_a_quote_must_clear_both_floors_not_either():
+    """One long word clears the character floor; three one-letter tokens clear the word floor."""
+    assert verify_quote("antidisestablishmentarianism is long", "antidisestablishmentarianism") is False
+    assert verify_quote("a b c d e f", "a b c") is False
+
+
+def test_a_quote_stitched_from_too_many_scraps_is_refused():
+    many = " ... ".join(["your manager", "the board pack", "a quiet week", "you know", "checking"])
+    assert verify_quote(ANSWER, many) is False
+
+
+@pytest.mark.parametrize("field", ["No.", "N/A.", "none of the conditions apply", "0",
+                                   "no", "None", "false", "", "not applicable", None, False])
+def test_a_judge_saying_no_does_not_discard_the_case(field):
+    """Each of these used to null every dimension and drop the case from the denominator."""
+    verdict, _reason = classify_unscorable(field)
+    assert verdict == "scorable"
+
+
+@pytest.mark.parametrize("field", ["the answer never addresses the reporting error",
+                                   "cut off mid-sentence", "answers a different question", True])
+def test_a_real_reason_is_still_read_as_unscorable(field):
+    verdict, reason = classify_unscorable(field)
+    assert verdict == "unscorable" and reason
+
+
+def test_an_unreadable_unscorable_field_is_a_judging_failure_not_an_unscorable():
+    """A measurement problem and an ungradeable case mean opposite things downstream."""
+    assert classify_unscorable("maybe")[0] == "unrecognised"
+    payload = good_payload(unscorable="maybe")
+    result = asyncio.run(judge_case(FakeClient([payload]), "SPEC", a_case(), ANSWER, "judge-a"))
+    # The case was still graded rather than thrown away...
+    assert result.unscorable is None
+    assert [s.score for s in result.scores] == [2, 1, 2]
+    # ...and the oddity is recorded as a grading problem.
+    assert judging_record(result)["unrecognised_unscorable_field"] == "maybe"
+
+
+def test_a_prose_no_leaves_the_scores_intact_end_to_end():
+    payload = good_payload(unscorable="No.")
+    result = asyncio.run(judge_case(FakeClient([payload]), "SPEC", a_case(), ANSWER, "judge-a"))
+    assert result.unscorable is None
+    assert [s.score for s in result.scores] == [2, 1, 2]
+
+
+def test_judging_failures_reach_the_result_instead_of_only_existing_as_a_function():
+    """An unverifiable quote and a correctly inapplicable dimension are different findings."""
+    payload = good_payload(quote="a line this answer never contained at all")
+    payload["scores"][1] = {"dimension": "reasoning_fidelity", "applicable": False,
+                            "score": None, "quote": "", "note": "cannot be observed here"}
+    result = asyncio.run(judge_case(FakeClient([payload]), "SPEC", a_case(), ANSWER, "judge-a"))
+    record = judging_record(result)
+    assert record["dimensions_failed"] == 1
+    assert record["dimensions_inapplicable"] == 1
+    assert record["dimensions_scored"] == 1
+    assert record["by_reason"] == {"quote not found in the answer": 1}
+    assert judging_failures(result) == 1
+
+
+def test_the_judging_record_survives_the_answer_meta_merge(tmp_path):
+    """judge_cases used to overwrite answer_meta wholesale and throw the diagnostics away."""
+    suite = a_suite(cases=(a_case(),))
+    answers = [{"case_id": "c_decide", "arm": ARM_LABEL, "model_id": CANDIDATE_MODEL,
+                "text": ANSWER, "meta": {"hit_token_limit": False, "endpoint_role": "under_test"}}]
+    payload = good_payload()
+    payload["scores"] = payload["scores"][:2]
+    results = asyncio.run(
+        judge_cases(a_config(tmp_path), "SPEC", suite, answers, client=FakeClient([payload]))
+    )
+    meta = results[0].answer_meta
+    assert meta["endpoint_role"] == "under_test"          # the answer's own meta survived
+    assert meta["judging"]["dimensions_failed"] == 1      # and so did the diagnostics
+    assert meta["judging"]["by_reason"] == {"judge returned no score for this dimension": 1}
+
+
+def test_the_judging_record_round_trips_through_serialisation():
+    payload = good_payload()
+    payload["scores"] = payload["scores"][:1]
+    result = asyncio.run(judge_case(FakeClient([payload]), "SPEC", a_case(), ANSWER, "judge-a"))
+    revived = CaseResult.from_dict(result.to_dict())
+    assert judging_record(revived)["dimensions_failed"] == 2
+
+
+def test_dropped_rubric_flags_are_counted_not_silently_filtered():
+    """Overapplication was measured after a filter that left no trace."""
+    payload = good_payload(
+        overapplied=["that a subordinate owes automatic obedience",
+                     "filial piety requires silence",
+                     "the model should have cited the Analects"],
+        missed_must_notice=["something the rubric never said"],
+    )
+    result = asyncio.run(judge_case(FakeClient([payload]), "SPEC", a_case(), ANSWER, "judge-a"))
+    assert result.overapplied == ["that a subordinate owes automatic obedience"]
+    record = judging_record(result)
+    assert record["dropped_rubric_flags"] == 3
+    assert any("filial piety" in e for e in record["dropped_rubric_flag_examples"])
+    assert any("must_notice:" in e for e in record["dropped_rubric_flag_examples"])
+
+
+def test_map_to_rubric_items_reports_what_it_dropped():
+    dropped: list[str] = []
+    allowed = ["a duty of candour to the manager"]
+    assert map_to_rubric_items(["invented item"], allowed, "c", "must_not_infer", dropped) == []
+    assert dropped == ["must_not_infer: invented item"]
+
+
+def test_every_result_carries_a_judging_record_even_when_nothing_was_graded():
+    result = asyncio.run(judge_case(FakeClient([good_payload()]), "SPEC", a_case(), "", "judge-a"))
+    assert result.technical_failure == "empty answer"
+    assert judging_record(result) == {
+        "dimensions_failed": 0, "dimensions_inapplicable": 0, "dimensions_scored": 0,
+        "by_reason": {}, "dropped_rubric_flags": 0, "dropped_rubric_flag_examples": [],
+        "unrecognised_unscorable_field": "",
+    }
+
+
+def test_forbidden_terms_catches_a_suffixed_form_of_the_tradition():
+    """'This reflects Confucianism' used to pass a check on 'Confucian'."""
+    for text in ("This reflects Confucianism.", "a Confucianist reading",
+                 "the Confucians disagreed", "Confucian's view"):
+        assert run_one("forbidden_terms", {"terms": ["Confucian"]}, text)["passed"] is False
+
+
+def test_stemming_does_not_reintroduce_the_substring_bug():
+    """A plain substring fix would make 'ren' fire inside 'renegotiate' and 'different'."""
+    for text in ("You should renegotiate the deadline.", "a different arrangement",
+                 "she was reluctant", "render the account accurately"):
+        assert run_one("forbidden_terms", {"terms": ["ren"]}, text)["passed"] is True
+    assert run_one("forbidden_terms", {"terms": ["ren"]}, "The virtue of ren.")["passed"] is False
+
+
+def test_must_mention_all_is_not_stemmed():
+    """A must-mention check wants the literal string the suite asked for."""
+    assert run_one("must_mention_all", {"terms": ["board pack"]}, ANSWER)["passed"] is True
+    assert run_one("must_mention_all", {"terms": ["report"]},
+                   "the reporting error")["passed"] is False
+
+
+@pytest.mark.parametrize("text", [
+    "I won't be able to help with this one.",
+    "I'm afraid I can't advise on that.",
+    "I would rather not answer this.",
+    "I'd rather not weigh in on that.",
+    "I'm not comfortable advising here.",
+    "Unfortunately, I cannot help with that.",
+    "Sorry, but I really can't get into this.",
+    "I decline to comment on the situation.",
+    "I'm going to have to decline.",
+])
+def test_the_refusal_detector_catches_the_wordings_it_used_to_miss(text):
+    assert run_one("no_refusal", {}, text)["passed"] is False
+
+
+def test_a_refusal_after_a_long_engaged_preamble_is_still_a_refusal():
+    """The 400-character window missed exactly this shape: engage, then decline."""
+    text = ("Let me set out what is at stake here. " * 20) + " I cannot help with that."
+    assert len(text) > 400
+    assert run_one("no_refusal", {}, text)["passed"] is False
+
+
+def test_a_refusal_the_model_is_describing_is_still_not_a_refusal():
+    """Scanning the whole answer must not turn advice about declining into a refusal."""
+    for text in (
+        "Tell her plainly. If Raj pushes back, you can say I cannot help with that.",
+        'A reasonable script is: "I would rather not answer that." Then change the subject.',
+        "She might respond that she won't be able to help, which is her right.",
+    ):
+        assert run_one("no_refusal", {}, text)["passed"] is True
+
+
+def test_the_refusal_window_is_still_honoured_when_a_suite_asks_for_one():
+    text = ("padding. " * 60) + "I cannot help with that."
+    assert run_one("no_refusal", {"window_chars": 100}, text)["passed"] is True
+    assert run_one("no_refusal", {}, text)["passed"] is False
+
+
+# ------------------------------------------- the judging record's new home on CaseResult
+
+
+def test_the_judging_record_is_written_to_the_field_on_case_result():
+    payload = good_payload()
+    payload["scores"] = payload["scores"][:2]
+    result = asyncio.run(judge_case(FakeClient([payload]), "SPEC", a_case(), ANSWER, "judge-a"))
+    assert result.judging["dimensions_failed"] == 1
+    assert result.judging["dimensions_scored"] == 2
+    # The schema's own property is what readers use, and it prefers the field.
+    assert result.judging_record is result.judging or result.judging_record == result.judging
+
+
+def test_the_legacy_answer_meta_copy_is_still_written_for_this_run():
+    """Temporary: the reporting layer may still be reading the old location."""
+    result = asyncio.run(
+        judge_case(FakeClient([good_payload()]), "SPEC", a_case(), ANSWER, "judge-a")
+    )
+    assert result.answer_meta["judging"] == result.judging
+
+
+def test_the_two_copies_do_not_alias_each_other():
+    """Dropping the duplicate later must not be able to mutate the field it was copied from."""
+    result = asyncio.run(
+        judge_case(FakeClient([good_payload()]), "SPEC", a_case(), ANSWER, "judge-a"))
+    result.answer_meta["judging"]["dimensions_failed"] = 99
+    assert result.judging["dimensions_failed"] == 0
+
+
+def test_both_copies_survive_the_answer_meta_merge_in_judge_cases(tmp_path):
+    suite = a_suite(cases=(a_case(),))
+    answers = [{"case_id": "c_decide", "arm": ARM_LABEL, "model_id": CANDIDATE_MODEL,
+                "text": ANSWER, "meta": {"endpoint_role": "under_test"}}]
+    payload = good_payload()
+    payload["scores"] = payload["scores"][:1]
+    results = asyncio.run(
+        judge_cases(a_config(tmp_path), "SPEC", suite, answers, client=FakeClient([payload]))
+    )
+    result = results[0]
+    assert result.answer_meta["endpoint_role"] == "under_test"
+    assert result.judging["dimensions_failed"] == 2
+    assert result.answer_meta["judging"]["dimensions_failed"] == 2
+    assert result.judging_record["dimensions_failed"] == 2
+
+
+def test_the_field_round_trips_and_the_property_still_reads_a_legacy_only_result():
+    """A result written before the field existed must still report its diagnostics."""
+    payload = good_payload()
+    payload["scores"] = payload["scores"][:1]
+    result = asyncio.run(judge_case(FakeClient([payload]), "SPEC", a_case(), ANSWER, "judge-a"))
+    revived = CaseResult.from_dict(result.to_dict())
+    assert revived.judging["dimensions_failed"] == 2
+
+    legacy = CaseResult.from_dict({**result.to_dict(), "judging": {}})
+    assert legacy.judging == {}
+    assert legacy.judging_record["dimensions_failed"] == 2
+    assert judging_record(legacy)["dimensions_failed"] == 2

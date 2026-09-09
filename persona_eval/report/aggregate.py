@@ -988,11 +988,24 @@ def _split_verdicts(
     return primary, repeats
 
 
-def _arm_order(results: Sequence[CaseResult], baseline_arm: str | None) -> tuple[str, ...]:
+def _arm_order(
+    results: Sequence[CaseResult],
+    baseline_arm: str | None,
+    verdicts: Sequence[ChangeVerdict] = (),
+) -> tuple[str, ...]:
+    """Arms in the order they first appear, baseline first.
+
+    Verdicts count as well as results. An arm whose answers all failed technically still has
+    variant verdicts, and deriving the arm list from results alone dropped its behaviour rates
+    from the report entirely rather than showing them against an empty denominator.
+    """
     seen: list[str] = []
     for result in results:
         if result.arm not in seen:
             seen.append(result.arm)
+    for verdict in verdicts:
+        if verdict.arm and verdict.arm not in seen:
+            seen.append(verdict.arm)
     if baseline_arm and baseline_arm in seen:
         seen.remove(baseline_arm)
         seen.insert(0, baseline_arm)
@@ -2544,7 +2557,7 @@ def analyse(
 
     primary, repeats = _split_passes(results, notes)
     primary_verdicts, repeat_verdicts = _split_verdicts(verdicts, notes)
-    arms = _arm_order(primary or results, baseline_arm)
+    arms = _arm_order(primary or results, baseline_arm, primary_verdicts)
     baseline = _pick_baseline(arms, baseline_arm)
 
     family_kind = {f.family_id: f.kind for f in suite.families}
@@ -2563,12 +2576,13 @@ def analyse(
             f"{len(orphan_cases)} case id(s) in the results are not in the suite "
             f"({', '.join(orphan_cases[:4])}); their prompts could not be quoted."
         )
-    verdict_arms = {v.arm for v in primary_verdicts} - set(arms)
-    if verdict_arms:
+    graded_arms = {r.arm for r in primary if is_graded(r)}
+    verdict_only = {v.arm for v in primary_verdicts} - graded_arms
+    if verdict_only:
         notes.append(
-            "Change verdicts reference arm(s) with no graded results: "
-            + ", ".join(sorted(verdict_arms))
-            + "."
+            "Change verdicts exist for arm(s) with no graded case results: "
+            + ", ".join(sorted(verdict_only))
+            + ". Their behaviour rates are reported; their dimension scores are empty."
         )
 
     kinds_present: list[str] = []
@@ -2688,19 +2702,26 @@ __all__ = [
     "FamilyCount",
     "FamilyKindStat",
     "FlagStat",
+    "FormatPremium",
+    "HOLD_MEASURES",
     "GROUP_MEANING",
     "GroupStat",
     "IntegrityStat",
     "JudgeCoverage",
     "JudgeDivergence",
     "MATERIAL_DID",
+    "MATERIAL_PREMIUM",
+    "MOVE_MEASURES",
     "MEASURE_MEANING",
     "MEASURE_ORDER",
     "MIN_CELL_N",
+    "PairingLoss",
     "PositionAudit",
     "ReliabilityStat",
+    "SELF_CONSISTENCY",
     "SMALL_N",
     "VerbosityAudit",
+    "VerdictStability",
     "WorstExample",
     "ZeroPattern",
     "analyse",
@@ -2710,6 +2731,7 @@ __all__ = [
     "group_mean",
     "group_of",
     "is_graded",
+    "was_truncated",
     "pearson",
     "sign_test_p",
     "spearman",

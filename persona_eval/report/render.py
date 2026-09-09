@@ -32,6 +32,8 @@ from typing import Any, Mapping, Sequence
 from persona_eval.report.aggregate import (
     GROUP_MEANING,
     MATERIAL_DID,
+    MATERIAL_PREMIUM,
+    SELF_CONSISTENCY,
     MEASURE_MEANING,
     MEASURE_ORDER,
     MIN_CELL_N,
@@ -52,6 +54,10 @@ from persona_eval.suite.schema import (
 logger = logging.getLogger("persona_eval.report.render")
 
 REPORT_FILE = "report.md"
+
+#: Slice kinds that count as a slice in the "N of M regressed" headline. The dimension-by-kind
+#: cells are excluded: they are a matrix view of the same data at much smaller n.
+HEADLINE_SLICES: tuple[str, ...] = ("group", "dimension", "family_kind", "measures")
 
 ANSWER_EXCERPT_CHARS = 700
 PROMPT_EXCERPT_CHARS = 320
@@ -523,31 +529,79 @@ def _behaviour(analysis: Analysis) -> list[str]:
             "hold a position under rewording or move under a genuine correction."
         )
     else:
+        floors = [s for s in analysis.behaviour_stats if s.measures == SELF_CONSISTENCY]
+        if floors:
+            lines += [
+                "The first row for each arm is its noise floor: the same question asked twice "
+                "with nothing changed, and how often the arm gave the same answer. Every rate "
+                "below it is built on top of that. An arm that reproduces its own position only "
+                "seven times in ten cannot demonstrate invariance at seven in ten, because it "
+                "would score that by doing nothing.",
+                "",
+            ]
+        else:
+            lines += [
+                "No self-consistency probe was run, so these rates have no noise floor to be "
+                "read against. An arm that answers the same question differently on two "
+                "occasions would score against itself here, and nothing in this run distinguishes "
+                "that from a judgment that genuinely moved.",
+                "",
+            ]
         lines += [
             "Each verdict compares one variant against the original of the same situation and "
             "asks whether the judgment moved. The suite committed to the expected answer before "
             "any model saw the case.",
             "",
-            "| behaviour | arm | correct | n verdicts | rate | families | variants |",
-            "|---|---|---|---|---|---|---|",
+            "| behaviour | arm | correct | n verdicts | rate | noise floor | above floor "
+            "| families | variants |",
+            "|---|---|---|---|---|---|---|---|---|",
         ]
         order = {name: index for index, name in enumerate(MEASURE_ORDER)}
         arm_order = {arm: index for index, arm in enumerate(analysis.arms)}
         for stat in sorted(
             analysis.behaviour_stats,
             key=lambda s: (
-                order.get(s.measures, len(order)),
-                s.measures,
                 arm_order.get(s.arm, len(arm_order)),
                 s.arm,
+                order.get(s.measures, len(order)),
+                s.measures,
             ),
         ):
             variants = ", ".join(f"{k} x{v}" for k, v in sorted(stat.variants.items())) or "-"
             undecided = f" (+{stat.undecided} undecided)" if stat.undecided else ""
+            floor = "-" if stat.noise_floor is None else f"{stat.noise_floor:.0%} ({stat.floor_kind})"
+            above = (
+                "-"
+                if stat.above_floor is None
+                else ("**" + f"{stat.above_floor:+.0%}" + "**" if stat.at_or_below_floor else f"{stat.above_floor:+.0%}")
+            )
             lines.append(
                 f"| {stat.measures} | `{stat.arm}` | {stat.correct} | {stat.n}{undecided} "
-                f"| **{_pct(stat.rate)}** | {stat.families} | {_cell(variants, 60)} |"
+                f"| **{_rate(stat.rate, stat.n)}** | {floor} | {above} "
+                f"| {stat.families} | {_cell(variants, 60)} |"
             )
+        drowned = [s for s in analysis.behaviour_stats if s.at_or_below_floor]
+        if drowned:
+            lines += ["", ""]
+            for stat in drowned:
+                if stat.floor_kind == "consistency":
+                    lines.append(
+                        f"**`{stat.arm}` measured nothing on {stat.measures}.** Its rate of "
+                        f"{_rate(stat.rate, stat.n)} is at or below its own noise floor of "
+                        f"{_pct(stat.noise_floor)}, which is how often it reproduces its answer "
+                        f"to an unchanged question. A result at the floor is what sampling noise "
+                        f"alone produces, so this number is not evidence that the arm holds or "
+                        f"fails to hold a position."
+                    )
+                else:
+                    lines.append(
+                        f"**`{stat.arm}` measured nothing on {stat.measures}.** Its rate of "
+                        f"{_rate(stat.rate, stat.n)} is at or below the "
+                        f"{_pct(stat.noise_floor)} it would score by changing its answer at "
+                        f"random, given how inconsistent it is on unchanged questions. Moving "
+                        f"when the facts move is only evidence if the arm stays put when they "
+                        f"do not."
+                    )
         lines += ["", "What each behaviour means:", ""]
         seen = {stat.measures for stat in analysis.behaviour_stats}
         for measure in list(MEASURE_ORDER) + sorted(seen - set(MEASURE_ORDER)):
@@ -556,7 +610,10 @@ def _behaviour(analysis: Analysis) -> list[str]:
         lines.append("")
         lines.append(
             "A verdict recorded as undecided is one the judge could not call. It is outside the "
-            "rate rather than counted against the arm."
+            "rate rather than counted against the arm. The floor column names which of the two "
+            "baselines applies: `consistency` where the expected answer is that the position "
+            "held, and `chance` where it is that the position moved, since an arm that moves at "
+            "random scores for free on those."
         )
         wrong = [
             (stat, example)
@@ -586,7 +643,8 @@ def _behaviour(analysis: Analysis) -> list[str]:
         ]
         for stat in analysis.family_kind_stats:
             verdicts = (
-                f"{stat.verdicts_correct}/{stat.verdicts} ({_pct(stat.verdict_rate)})"
+                f"{stat.verdicts_correct}/{stat.verdicts} "
+                f"({_rate(stat.verdict_rate, stat.verdicts)})"
                 if stat.verdicts
                 else "-"
             )
@@ -631,9 +689,11 @@ def _overapplication(analysis: Analysis) -> list[str]:
                 f"| {scope} | `{stat.arm}` | {stat.eligible_cases} | {stat.eligible_families} "
                 f"| {stat.with_explicit_must_not_infer} "
                 f"| {stat.overapplied_cases} ({stat.overapplied_families} fam) "
-                f"| **{_pct(stat.overapplied_rate)}** "
-                f"| {stat.unacceptable_reasoning_cases} ({_pct(stat.unacceptable_reasoning_rate)}) "
-                f"| {stat.missed_must_notice_cases} ({_pct(stat.missed_must_notice_rate)}) |"
+                f"| **{_rate(stat.overapplied_rate, stat.eligible_cases)}** "
+                f"| {stat.unacceptable_reasoning_cases} "
+                f"({_rate(stat.unacceptable_reasoning_rate, stat.eligible_cases)}) "
+                f"| {stat.missed_must_notice_cases} "
+                f"({_rate(stat.missed_must_notice_rate, stat.eligible_cases)}) |"
             )
     negative = [s for s in analysis.flag_stats if s.scope == "negative_control"]
     lines.append("")
@@ -696,6 +756,35 @@ def _change_rows(lines: list[str], changes: Sequence[ChangeStat], label: str) ->
         )
 
 
+def _premium_note(analysis: Analysis, rows: Sequence[ChangeStat]) -> list[str]:
+    """Print the format premium next to the group comparison it could explain."""
+    material = [premium for premium in analysis.format_premium if premium.material]
+    if not material:
+        return []
+    lines = [""]
+    for premium in material:
+        gain = next((row for row in rows if row.slice_name == premium.group), None)
+        if gain is None or gain.delta is None:
+            continue
+        if gain.delta <= 0:
+            continue
+        share = premium.premium / gain.delta if gain.delta else None
+        verdict = (
+            "the format explains the whole of it"
+            if share is not None and share >= 1.0
+            else f"the format explains about {share:.0%} of it"
+            if share is not None
+            else ""
+        )
+        lines.append(
+            f"**The {premium.group} gain of {_signed(gain.delta)} sits against a format premium "
+            f"of {_signed(premium.premium)}**, measured by rewriting `{premium.source_arm}` "
+            f"answers into the adapted shape with the substance unchanged. On these numbers "
+            f"{verdict}. See the format premium section."
+        )
+    return lines if len(lines) > 1 else []
+
+
 def _change_from_baseline(analysis: Analysis) -> list[str]:
     lines = ["", "## Change from baseline", ""]
     if not analysis.changes or not analysis.baseline_arm:
@@ -708,7 +797,10 @@ def _change_from_baseline(analysis: Analysis) -> list[str]:
     for arm in analysis.arms:
         if arm == analysis.baseline_arm:
             continue
-        subset = [c for c in analysis.changes if c.arm == arm]
+        # The dimension-by-kind cells are rendered as a matrix under Diagnostic scores. Counting
+        # them here would put "20 of 51 slices regressed" on a page whose slices are supposed to
+        # be whole dimensions and whole family kinds, and would let a one-case cell win.
+        subset = [c for c in analysis.changes if c.arm == arm and c.slice_kind in HEADLINE_SLICES]
         if not subset:
             continue
         lines += [
@@ -719,18 +811,43 @@ def _change_from_baseline(analysis: Analysis) -> list[str]:
             "scored on are counted. The difference is `arm - baseline`, so a negative number is "
             "a regression.",
         ]
+        imbalance = analysis.graded_imbalance
+        if imbalance is not None:
+            fewest, most, gap = imbalance
+            lines += [
+                "",
+                f"**These pairs are not a random sample of the suite.** `{fewest}` was graded on "
+                f"{_plural(gap, 'case')} fewer than `{most}`, and every figure below drops the "
+                f"cases only one arm managed. Where those losses were truncations they fall on "
+                f"the arm's longest answers, so the surviving pairs favour it. The integrity "
+                f"section lists which cases went and why.",
+            ]
         regressions = [c for c in subset if c.delta is not None and c.delta < -0.001]
         improvements = [c for c in subset if c.delta is not None and c.delta > 0.001]
         if regressions:
-            worst = min(regressions, key=lambda c: c.delta or 0.0)
+            # Rank among slices that clear the interpretability floor when there are any. A
+            # two-point swing over one case is the largest number on the page and the least
+            # informative thing on it, and naming it as the headline finding would be wrong.
+            solid = [c for c in regressions if c.paired >= MIN_CELL_N]
+            worst = min(solid or regressions, key=lambda c: c.delta or 0.0)
             lines += [
                 "",
-                f"**{len(regressions)} of {len(subset)} slices regressed.** The largest is "
-                f"{worst.slice_name} at {_signed(worst.delta)} over "
+                f"**{len(regressions)} of {len(subset)} slices regressed.** The largest"
+                + ("" if solid else " (and no regressed slice clears the interpretability floor)")
+                + f" is {worst.slice_name} at {_signed(worst.delta)} over "
                 f"{_plural(worst.paired, 'paired case')} from "
                 f"{_plural(worst.families, 'family', 'families')}, with {worst.worse} worse "
                 f"against {worst.better} better.",
             ]
+            if solid and len(solid) < len(regressions):
+                biggest = min(regressions, key=lambda c: c.delta or 0.0)
+                if biggest is not worst:
+                    lines.append("")
+                    lines.append(
+                        f"A larger number appears on {biggest.slice_name} at "
+                        f"{_signed(biggest.delta)}, but it rests on "
+                        f"{_plural(biggest.paired, 'paired case')} and is not quotable."
+                    )
         else:
             lines += ["", f"No slice regressed. {len(improvements)} of {len(subset)} improved."]
 
@@ -743,6 +860,8 @@ def _change_from_baseline(analysis: Analysis) -> list[str]:
             rows = [c for c in subset if c.slice_kind == kind]
             if rows:
                 _change_rows(lines, rows, label)
+            if kind == "group":
+                lines += _premium_note(analysis, rows)
         lines += [
             "",
             "The sign test is exact and two-sided over the discordant pairs only. It has very "
@@ -778,7 +897,7 @@ def _worst(analysis: Analysis) -> list[str]:
     for pattern in shown[:24]:
         lines.append(
             f"| `{pattern.arm}` | {pattern.dimension} | {pattern.group} | **{pattern.zeros}** "
-            f"| {pattern.scored} | {_pct(pattern.rate)} | {pattern.families} |"
+            f"| {pattern.scored} | {_rate(pattern.rate, pattern.scored)} | {pattern.families} |"
         )
     if not shown:
         lines.append("| - | no dimension scored 0 | - | 0 | - | - | - |")
@@ -849,6 +968,131 @@ def _worst_example(example: WorstExample) -> list[str]:
 # ------------------------------------------------------------ reliability and unresolved counts
 
 
+def _verdict_stability(analysis: Analysis) -> list[str]:
+    """Whether a re-judged change verdict came back the same way.
+
+    Each behaviour rate is a pile of single binary judgments. Without re-judging some of them,
+    a 60% invariance rate and a coin flip look the same on the page.
+    """
+    if not analysis.verdict_stability:
+        if analysis.behaviour_stats:
+            return [
+                "",
+                "No change verdict was re-judged, so the behaviour rates above carry no evidence "
+                "of their own stability. Each rests on one binary judgment per probe.",
+            ]
+        return []
+    lines = [
+        "",
+        "Change verdicts re-judged. Each behaviour rate is built from single binary judgments, "
+        "so this is what says whether those judgments are repeatable at all.",
+        "",
+        "| arm | scope | probes re-judged | same verdict | agreement | families |",
+        "|---|---|---|---|---|---|",
+    ]
+    for stat in analysis.verdict_stability:
+        lines.append(
+            f"| `{stat.arm}` | {stat.scope} | {stat.pairs} | {stat.agree} "
+            f"| **{_rate(stat.rate, stat.pairs)}** | {stat.families} |"
+        )
+    flipped = [(stat, item) for stat in analysis.verdict_stability for item in stat.flipped]
+    if flipped:
+        lines += ["", "Probes whose verdict flipped between passes:", ""]
+        for stat, (case_id, movement) in flipped[:8]:
+            lines.append(f"- `{stat.arm}` ({stat.scope}) `{case_id}`: did_change {movement}")
+        lines += [
+            "",
+            "A probe that flips is one whose contribution to a behaviour rate is arbitrary. If "
+            "the flip rate is comparable to the gap between two arms' rates, the gap is noise.",
+        ]
+    return lines
+
+
+def _truncation_warning(analysis: Analysis) -> list[str]:
+    """Truncation named as a bias, not just a count.
+
+    A truncated answer becomes a technical failure and leaves every denominator. That is the
+    right treatment for a network error, which strikes at random. It is the wrong treatment for
+    a token ceiling, which strikes the arm that writes longest, on the cases where it rambles,
+    which are disproportionately the cases it was answering worst.
+    """
+    truncating = [stat for stat in analysis.integrity if stat.truncated]
+    if not truncating:
+        return []
+    worst = max(truncating, key=lambda stat: stat.truncated)
+    lines = [
+        "",
+        "**Some answers hit the token ceiling.** "
+        + ", ".join(
+            f"`{stat.arm}` truncated {_plural(stat.truncated, 'answer')}"
+            + (f", {stat.truncated_and_lost} of which left the denominators" if stat.truncated_and_lost else "")
+            for stat in truncating
+        )
+        + ".",
+    ]
+    if any(stat.truncated_and_lost for stat in truncating):
+        lines.append("")
+        lines.append(
+            f"Truncation does not remove cases at random. The arm that writes longest hits the "
+            f"ceiling most, and it hits it on the cases where it rambles, which tend to be the "
+            f"cases it was handling worst. Dropping those raises that arm's mean and shortens "
+            f"its denominator at the same time. `{worst.arm}` lost the most this way, so read "
+            f"its scores as an upper bound."
+        )
+    if truncating and worst.truncated_cases:
+        lines.append("")
+        lines.append(
+            "Truncated cases include: "
+            + ", ".join(f"`{case_id}`" for case_id in worst.truncated_cases[:6])
+            + "."
+        )
+    return lines
+
+
+def _imbalance_warning(analysis: Analysis) -> list[str]:
+    """State plainly when the arms did not get graded on the same number of cases."""
+    imbalance = analysis.graded_imbalance
+    if imbalance is None:
+        if len(analysis.integrity) > 1:
+            return [
+                "",
+                "Both arms were graded on the same number of cases, so no paired comparison in "
+                "this report is drawing on a subset chosen by which arm failed.",
+            ]
+        return []
+    fewest, most, gap = imbalance
+    lines = [
+        "",
+        f"**The arms were not graded on the same cases.** `{fewest}` was graded on "
+        f"{_plural(gap, 'case')} fewer than `{most}`. Every paired comparison in this report "
+        f"drops the cases only one arm managed, so those comparisons are between the two arms "
+        f"on the subset where `{fewest}` succeeded. If it failed on its hardest cases, that "
+        f"subset flatters it.",
+    ]
+    for loss in analysis.pairing_losses:
+        if loss.balanced:
+            continue
+        lines.append("")
+        lines.append(
+            f"`{loss.arm}` against `{loss.baseline_arm}`: {loss.both} cases paired, "
+            f"{loss.baseline_only} scored only for `{loss.baseline_arm}`, {loss.arm_only} only "
+            f"for `{loss.arm}`."
+        )
+        if loss.baseline_only_cases:
+            lines.append(
+                f"Dropped because `{loss.arm}` had no score: "
+                + ", ".join(f"`{case_id}`" for case_id in loss.baseline_only_cases[:6])
+                + "."
+            )
+        if loss.arm_only_cases:
+            lines.append(
+                f"Dropped because `{loss.baseline_arm}` had no score: "
+                + ", ".join(f"`{case_id}`" for case_id in loss.arm_only_cases[:6])
+                + "."
+            )
+    return lines
+
+
 def _reliability(analysis: Analysis) -> list[str]:
     lines = ["", "## Grading reliability and unresolved counts", ""]
     if not analysis.reliability:
@@ -862,21 +1106,33 @@ def _reliability(analysis: Analysis) -> list[str]:
             "A sample of answers was judged twice. Agreement is measured over the dimension "
             "scores both passes produced.",
             "",
-            "| arm | cases re-judged | families | dimension pairs | exact | within 1 "
+            "| arm | scope | cases re-judged | families | dimension pairs | exact | within 1 "
             "| mean absolute difference | scorability disagreements |",
-            "|---|---|---|---|---|---|---|---|",
+            "|---|---|---|---|---|---|---|---|---|",
         ]
         for stat in analysis.reliability:
-            exact = f"{stat.exact}/{stat.pairs} ({_pct(stat.exact / stat.pairs)})" if stat.pairs else "-"
+            exact = (
+                f"{stat.exact}/{stat.pairs} ({_rate(stat.exact / stat.pairs, stat.pairs)})"
+                if stat.pairs
+                else "-"
+            )
             within = (
-                f"{stat.within_one}/{stat.pairs} ({_pct(stat.within_one / stat.pairs)})"
+                f"{stat.within_one}/{stat.pairs} ({_rate(stat.within_one / stat.pairs, stat.pairs)})"
                 if stat.pairs
                 else "-"
             )
             lines.append(
-                f"| `{stat.arm}` | {stat.cases} | {stat.families} | {stat.pairs} | **{exact}** "
-                f"| {within} | {_num(stat.mean_abs_diff)} | {stat.scorability_disagreements} |"
+                f"| `{stat.arm}` | {stat.scope} | {stat.cases} | {stat.families} | {stat.pairs} "
+                f"| **{exact}** | {within} | {_num(stat.mean_abs_diff)} "
+                f"| {stat.scorability_disagreements} |"
             )
+        lines += [
+            "",
+            "`same judge` is the primary judge looking at the same answer twice, which measures "
+            "its consistency with itself. `second judge` is a different model on the same "
+            "answer, which is the only one of the two that can show whether the reading of the "
+            "specification is shared rather than idiosyncratic.",
+        ]
         lines += [
             "",
             "A scorability disagreement is one pass scoring a dimension the other declared "
@@ -889,8 +1145,10 @@ def _reliability(analysis: Analysis) -> list[str]:
             for stat in agreement:
                 rate = stat.overapplication_agree / stat.overapplication_pairs
                 lines.append(
-                    f"- `{stat.arm}`: **{stat.overapplication_agree}/{stat.overapplication_pairs}** "
-                    f"({_pct(rate)}) of re-judged cases got the same flag."
+                    f"- `{stat.arm}` ({stat.scope}): "
+                    f"**{stat.overapplication_agree}/{stat.overapplication_pairs}** "
+                    f"({_rate(rate, stat.overapplication_pairs)}) of re-judged cases got the "
+                    f"same flag."
                 )
         worst = [(stat, item) for stat in analysis.reliability for item in stat.disagreements]
         if worst:
@@ -901,7 +1159,7 @@ def _reliability(analysis: Analysis) -> list[str]:
                     f"second pass {repeat}."
                 )
         models = [
-            f"`{stat.arm}` judged by "
+            f"`{stat.arm}` ({stat.scope}) judged by "
             + (", ".join(stat.first_pass_models) or "an unrecorded model")
             + " then "
             + (", ".join(stat.repeat_pass_models) or "an unrecorded model")
@@ -919,6 +1177,10 @@ def _reliability(analysis: Analysis) -> list[str]:
                 "model, or a human, is the check that would show that."
             )
 
+    # Independent of the dimension-score reliability above: a run can re-judge change verdicts
+    # without re-judging any scores, and the behaviour rates need this either way.
+    lines += _verdict_stability(analysis)
+
     lines += ["", "### What could not be graded", ""]
     if not analysis.integrity:
         lines.append("No results were recorded.")
@@ -928,15 +1190,44 @@ def _reliability(analysis: Analysis) -> list[str]:
         "problem and is never a philosophical failure; an unscorable case is one the rubric "
         "itself said could not be judged.",
         "",
-        "| arm | results | graded | unscorable | technical failures | empty answers "
-        "| graded but no score recorded |",
-        "|---|---|---|---|---|---|---|",
+        "| arm | results | graded | unscorable | technical failures | truncated "
+        "| truncated and lost | empty answers | graded but no score recorded |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for stat in analysis.integrity:
         lines.append(
             f"| `{stat.arm}` | {stat.results} | {stat.graded} | **{stat.unscorable}** "
-            f"| **{stat.technical_failures}** | {stat.empty_answers} | {stat.no_scores_recorded} |"
+            f"| **{stat.technical_failures}** | {stat.truncated} | **{stat.truncated_and_lost}** "
+            f"| {stat.empty_answers} | {stat.no_scores_recorded} |"
         )
+    lines += _truncation_warning(analysis)
+    lines += _imbalance_warning(analysis)
+    losses = [stat for stat in analysis.integrity if stat.judging_failures or stat.inapplicable_dimensions]
+    if losses:
+        lines += [
+            "",
+            "Individual dimension scores that never arrived, split by cause. A dimension the "
+            "task cannot express is correctly not scored; a dimension the grading lost is a "
+            "hole in the measurement, and only the second should worry a reader.",
+            "",
+            "| arm | lost to a grading problem | correctly inapplicable | checks that could not run |",
+            "|---|---|---|---|",
+        ]
+        for stat in losses:
+            lines.append(
+                f"| `{stat.arm}` | **{stat.judging_failures}** | {stat.inapplicable_dimensions} "
+                f"| {stat.deterministic_errors} |"
+            )
+        lost = sum(stat.judging_failures for stat in analysis.integrity)
+        if lost:
+            lines += [
+                "",
+                f"{_plural(lost, 'dimension score')} were lost to a grading problem: an "
+                f"unverifiable quote, a missing score, or a score outside 0/1/2. Those are "
+                f"absent from every mean above without shrinking any case count, so a run can "
+                f"lose a large share of its individual scores while every case still looks "
+                f"graded.",
+            ]
     reasons = [
         (stat.arm, "unscorable", text, count)
         for stat in analysis.integrity
@@ -967,14 +1258,82 @@ def _reliability(analysis: Analysis) -> list[str]:
             "",
             "Verifiable constraints checked programmatically, with no judge involved.",
             "",
-            "| arm | check | passed | n | rate | families |",
-            "|---|---|---|---|---|---|",
+            "| arm | check | passed | n | rate | could not run | families |",
+            "|---|---|---|---|---|---|---|",
         ]
         for stat in analysis.deterministic:
             lines.append(
                 f"| `{stat.arm}` | {stat.check} | {stat.passed} | {stat.n} "
-                f"| **{_pct(stat.rate)}** | {stat.families} |"
+                f"| **{_rate(stat.rate, stat.n)}** | {stat.errors} | {stat.families} |"
             )
+        errored = [stat for stat in analysis.deterministic if stat.errors]
+        if errored:
+            lines += [
+                "",
+                "A check in the could-not-run column is an unknown check kind or a verifier that "
+                "raised. That is a defect in the suite or the checker, so it is outside the pass "
+                "rate rather than counted as a failure by the arm: "
+                + ", ".join(f"`{stat.check}` x{stat.errors}" for stat in errored)
+                + ".",
+            ]
+    return lines
+
+
+def _format_premium_section(analysis: Analysis) -> list[str]:
+    """What the answer shape alone is worth, with the substance held constant."""
+    lines = ["", "## Format premium", ""]
+    if not analysis.format_premium:
+        lines.append(
+            "No form control was run. Nothing here separates a gain in judgment from a gain in "
+            "presentation, so any improvement reported above may be partly or wholly the shape "
+            "of the answers rather than their content."
+        )
+        return lines
+    sample = analysis.format_premium[0]
+    lines += [
+        f"`{sample.source_arm}` answers were rewritten into the adapted model's deliberative "
+        f"scaffold with the substance held constant, then judged blind against the same rubric "
+        f"as everything else. The gap between the original and the recast version is what the "
+        f"shape alone is worth.",
+        "",
+        "| group | source mean | recast mean | premium | better | worse | level | cases "
+        "| families | sign test |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for premium in analysis.format_premium:
+        lines.append(
+            f"| {premium.group} | {_num(premium.source_mean)} | {_num(premium.recast_mean)} "
+            f"| **{_signed(premium.premium)}** | {premium.better} | {premium.worse} "
+            f"| {premium.level} | {premium.cases}{' (small)' if premium.small_sample else ''} "
+            f"| {premium.families} | {_p(premium.p_value)} |"
+        )
+    material = [premium for premium in analysis.format_premium if premium.material]
+    lines.append("")
+    if material:
+        detail = "; ".join(
+            f"{_signed(premium.premium)} on {premium.group}" for premium in material
+        )
+        lines.append(
+            f"**The shape alone is worth {detail}.** The same substance, rewritten into the "
+            f"adapted model's format, scores that much higher from a judge that could not see "
+            f"which was which. Any gain the adapted arm shows on those groups that is no larger "
+            f"than this premium is a gain the format explains, not a change in judgment."
+        )
+    else:
+        lines.append(
+            f"**No material format premium.** Recasting the substance into the adapted shape "
+            f"moved the score by less than {MATERIAL_PREMIUM:.2f} on the 0-2 scale, so the "
+            f"differences reported above are not obviously explained by presentation. The "
+            f"sample is {_plural(sample.cases, 'case')}, small enough that a premium of this "
+            f"size could still be missed."
+        )
+    lines += [
+        "",
+        "This is the control for the failure the judging setup is most exposed to. The adapted "
+        "model was trained to produce a particular deliberative shape, and a judge reading for "
+        "substance can still be moved by a well-organised answer. Holding the substance fixed "
+        "and varying only the shape is what separates the two.",
+    ]
     return lines
 
 
@@ -1102,11 +1461,13 @@ def _judge_verdict(groups, curator: str, independent: str, arm: str) -> str:
         detail = "; ".join(
             f"{d.slice_name} by {_signed(d.difference_of_differences)}" for d in material
         )
+        groups = ", ".join(f"{d.slice_name}" for d in material)
         return (
             f"**`{curator}` is flattering `{arm}`.** It rates that arm above `{independent}` "
             f"does on {detail}, on the 0-2 scale, over {cases} both judges scored on both arms. "
-            f"Discount every headline improvement for this arm by roughly that much: that part "
-            f"of the gain is visible only to the judge the training was tuned toward."
+            f"Subtract that much from this arm's {groups} comparison in the change section: "
+            f"that part of the {groups} gain is visible only to the judge the training was "
+            f"tuned toward. Other groups are unaffected and should not be discounted."
         )
     lowest = min(groups, key=lambda d: d.difference_of_differences or 0.0)
     if (lowest.difference_of_differences or 0.0) <= -MATERIAL_DID:
@@ -1187,8 +1548,8 @@ def _bias(analysis: Analysis) -> list[str]:
             moved, changed = audit.change_by_order.get(order, (0, 0))
             lines.append(
                 f"| `{audit.arm}` | {_cell(order, 40)} | {decided} | {correct} "
-                f"| **{_pct(correct / decided) if decided else '-'}** | {changed} "
-                f"| {_pct(changed / moved) if moved else '-'} |"
+                f"| **{_rate(correct / decided, decided) if decided else '-'}** | {changed} "
+                f"| {_rate(changed / moved, moved) if moved else '-'} |"
             )
     pooled = next((audit for audit in analysis.position if audit.arm == "all"), None)
     if pooled is not None:
@@ -1330,7 +1691,7 @@ def _capability(analysis: Analysis) -> list[str]:
         unknown = f" (+{stat.unknown} unrecorded)" if stat.unknown else ""
         lines.append(
             f"| {stat.family} | `{stat.arm}` | {stat.passed} | {stat.n}{unknown} "
-            f"| **{_pct(stat.rate)}** |"
+            f"| **{_rate(stat.rate, stat.n)}** |"
         )
     failures = [(stat, item) for stat in analysis.capability for item in stat.failures]
     if failures:
@@ -1420,6 +1781,7 @@ def render_report(analysis: Analysis, suite: Suite, meta: Mapping[str, Any] | No
     lines += _change_from_baseline(analysis)
     lines += _worst(analysis)
     lines += _reliability(analysis)
+    lines += _format_premium_section(analysis)
     lines += _judge_disagreement(analysis)
     lines += _bias(analysis)
     lines += _sample_counts(analysis, suite)
@@ -1445,6 +1807,7 @@ REQUIRED_SECTIONS: tuple[str, ...] = (
     "## Change from baseline",
     "## Worst examples",
     "## Grading reliability and unresolved counts",
+    "## Format premium",
     "## Judge disagreement",
     "## Judge bias audits",
     "## Sample counts by scenario family",

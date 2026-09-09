@@ -546,6 +546,18 @@ class CaseResult:
     rubric_version: str = ""
     answer_meta: dict[str, Any] = field(default_factory=dict)
     judge_rationale: str = ""
+    # Facts about the GRADING rather than about the answer: how many dimensions were scored,
+    # how many failed to grade and why, how many were correctly inapplicable, and how many
+    # judge flags matched no rubric item. These are kept apart from `answer_meta` because a
+    # measurement problem and a model result must never be read off the same field. Without
+    # it, an omitted score, an out-of-range score and an unverifiable quote all look like a
+    # dimension that legitimately did not apply.
+    judging: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def judging_record(self) -> dict[str, Any]:
+        """The grading record, wherever it was written. Prefer the field; fall back once."""
+        return self.judging or (self.answer_meta or {}).get("judging") or {}
 
     @property
     def scored(self) -> list[DimensionScore]:

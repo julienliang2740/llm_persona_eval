@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -83,8 +84,21 @@ JUDGING_FAILURE_PREFIX = "judging_failure:"
 
 # A quotation shorter than this proves nothing: "the" appears in every answer. Below the
 # floor the score is discarded rather than accepted on a token match.
+#
+# Both floors must be met, not either. A single long word clears the character floor while
+# proving as little as three one-letter tokens clear the word floor.
 MIN_QUOTE_CHARS = 12
 MIN_QUOTE_WORDS = 3
+
+# ...and the same floors, lower, applied to EVERY fragment of an elided quotation. Without
+# a per-fragment floor the whole check has a one-line bypass: "a ... e ... i" is thirteen
+# characters and three words, and its three one-letter fragments appear in order in every
+# English sentence ever written, so it would verify against an answer it never came from.
+# Being strict here costs a real score now and then, and that loss is visible as a judging
+# failure; being lax lets a fabricated citation become a real number, and that is invisible.
+MIN_FRAGMENT_CHARS = 8
+MIN_FRAGMENT_WORDS = 2
+MAX_QUOTE_FRAGMENTS = 4
 
 TASK_MEANING: dict[str, str] = {
     "notice": "it asks what matters in the situation, and nothing more. An answer is not "
@@ -218,11 +232,25 @@ def verify_quote(answer_text: str, quote: str) -> bool:
     needle = normalise(quote)
     if not needle or not haystack:
         return False
-    if len(needle) < MIN_QUOTE_CHARS and len(needle.split()) < MIN_QUOTE_WORDS:
-        return False
+
     fragments = [f.strip() for f in needle.split("...") if f.strip()]
-    if not fragments:
+    if not fragments or len(fragments) > MAX_QUOTE_FRAGMENTS:
+        # A "quotation" stitched from five scraps is not a quotation.
         return False
+
+    # The floors are measured on the quoted CONTENT, with the ellipses removed, and both
+    # conditions must hold. Then every fragment must clear its own floor, or the elision
+    # syntax becomes a way to smuggle a one-character match past a check on the whole.
+    content = " ".join(fragments)
+    if len(content) < MIN_QUOTE_CHARS or len(content.split()) < MIN_QUOTE_WORDS:
+        return False
+    for fragment in fragments:
+        if len(fragment) < MIN_FRAGMENT_CHARS or len(fragment.split()) < MIN_FRAGMENT_WORDS:
+            return False
+
+    # In order and non-overlapping: each fragment is searched from the end of the last one,
+    # so a quote cannot be assembled by reading the answer backwards or by matching one span
+    # twice.
     position = 0
     for fragment in fragments:
         found = haystack.find(fragment, position)
@@ -232,7 +260,64 @@ def verify_quote(answer_text: str, quote: str) -> bool:
     return True
 
 
-def map_to_rubric_items(returned: Any, allowed: Sequence[str], case_id: str, field: str) -> list[str]:
+# What the judge might put in the "unscorable" field when it means "this case is fine".
+# Models answer a "leave empty unless..." field with a negation about as often as they leave
+# it empty, and every one of these used to null out all three dimensions and drop the case
+# from the denominator. An unscorable and a scorable case mean opposite things downstream,
+# so this is a mapping worth being generous about.
+_UNSCORABLE_NEGATIVES = frozenset(
+    {
+        "", "false", "no", "none", "null", "nil", "n/a", "n a", "na", "0", "nope", "-",
+        "not applicable", "scorable", "not unscorable", "no reason", "no issues",
+        "no problem", "no problems", "empty", "n/a - scorable",
+    }
+)
+_UNSCORABLE_AFFIRMATIVES = frozenset({"true", "yes", "1", "unscorable", "y"})
+# "none of the conditions apply", "not applicable here", "no - the answer is gradeable".
+_NEGATION_OPENER = re.compile(r"^(no|none|not|never|nothing|n/?a)\b")
+
+
+def classify_unscorable(raw: Any) -> tuple[str, str]:
+    """Read the judge's `unscorable` field. Returns (verdict, reason).
+
+    verdict is one of:
+
+      scorable      the judge is not claiming the case is ungradeable. Grade it.
+      unscorable    it is, and the reason is the second element.
+      unrecognised  the field holds something this cannot classify. That is a JUDGING
+                    failure, not an unscorable result, and the caller must not let it null
+                    out the case: a measurement problem and a case that cannot be graded
+                    are different findings and the report separates them.
+
+    Comparing raw strings against a fixed set is what went wrong before: "No.", "N/A." and
+    "0" each read as a substantive reason and silently discarded every score on the case.
+    """
+    if raw is None or raw is False:
+        return "scorable", ""
+    if raw is True:
+        return "unscorable", "the judge marked the case unscorable without giving a reason"
+    text = str(raw).strip()
+    key = normalise(text).strip(" .!?;:,-\"'")
+    if not key or key in _UNSCORABLE_NEGATIVES:
+        return "scorable", ""
+    if key in _UNSCORABLE_AFFIRMATIVES:
+        return "unscorable", "the judge marked the case unscorable without giving a reason"
+    if _NEGATION_OPENER.match(key):
+        return "scorable", ""
+    if len(key.split()) >= 2:
+        # Two words or more reads as a reason in prose: "cut off", "answers a different
+        # question", "the answer never addresses the error".
+        return "unscorable", text
+    return "unrecognised", text
+
+
+def map_to_rubric_items(
+    returned: Any,
+    allowed: Sequence[str],
+    case_id: str,
+    field: str,
+    dropped: list[str] | None = None,
+) -> list[str]:
     """Keep only the judge's entries that correspond to a frozen rubric item.
 
     The judge is asked to copy the rubric's wording; models paraphrase anyway, so an exact
@@ -241,6 +326,11 @@ def map_to_rubric_items(returned: Any, allowed: Sequence[str], case_id: str, fie
     failure category invented at grading time is exactly what "the judge must not invent
     principles" forbids, and silently keeping it would put an unfrozen standard into the
     results.
+
+    Unmatched entries are appended to `dropped` when the caller supplies a list. Discarding
+    them with only a log line meant overapplication was measured after an unrecorded filter:
+    a judge whose flags mostly failed to match produced a low overapplication rate that
+    looked like a well-behaved model.
     """
     if not allowed or not isinstance(returned, (list, tuple)):
         return []
@@ -265,6 +355,8 @@ def map_to_rubric_items(returned: Any, allowed: Sequence[str], case_id: str, fie
                 logger.warning(
                     "%s: judge reported a %s item that is not in the rubric: %r", case_id, field, text[:120]
                 )
+                if dropped is not None:
+                    dropped.append(f"{field}: {text[:160]}")
                 continue
         if match not in kept:
             kept.append(match)
@@ -380,6 +472,33 @@ async def judge_case(
     Never raises. A dead judge call becomes a `CaseResult` with `technical_failure` set, so
     one bad response cannot end a sweep that has already been paid for.
     """
+    extra: dict[str, Any] = {}
+    result = await _grade_case(
+        client, spec_text, case, answer_text, judge_role, pass_index,
+        situation=situation, turns_sent=turns_sent, truncated=truncated,
+        answer_error=answer_error, extra=extra,
+    )
+    # One exit, so no return path can skip the diagnostics.
+    set_judging_record(result, extra)
+    return result
+
+
+async def _grade_case(
+    client: ModelClient,
+    spec_text: str,
+    case: Case,
+    answer_text: str,
+    judge_role: ModelRole | str,
+    pass_index: int = 0,
+    *,
+    situation: str = "",
+    turns_sent: Sequence[dict[str, str]] | None = None,
+    truncated: bool = False,
+    answer_error: str = "",
+    extra: dict[str, Any] | None = None,
+) -> CaseResult:
+    """The body of judge_case. Separated only so judge_case has a single exit."""
+    extra = extra if extra is not None else {}
     model_name = judge_role.model if isinstance(judge_role, ModelRole) else str(judge_role)
     result = CaseResult(
         case_id=case.case_id,
@@ -429,9 +548,15 @@ async def judge_case(
         return result
 
     result.judge_rationale = str(payload.get("rationale", "")).strip()
-    unscorable = str(payload.get("unscorable", "") or "").strip()
-    if unscorable and unscorable.lower() not in {"false", "no", "none", "null", "n/a"}:
-        result.unscorable = unscorable
+    verdict, reason = classify_unscorable(payload.get("unscorable"))
+    if verdict == "unrecognised":
+        # Not a reason and not a negation. Record it as a grading problem and go on to
+        # score the case: nulling out every dimension on the strength of an unreadable
+        # field is how a judging failure gets counted as a philosophical one.
+        logger.warning("%s: unreadable 'unscorable' field %r; grading anyway", case.case_id, reason[:80])
+        extra["unrecognised_unscorable_field"] = reason[:160]
+    if verdict == "unscorable":
+        result.unscorable = reason
         result.scores = [
             DimensionScore(d, None, "", NOTE_CASE_UNSCORABLE) for d in case.rubric.dimensions
         ]
@@ -443,18 +568,26 @@ async def judge_case(
 
     scores, failures = parse_scores(payload, case, answer_text)
     result.scores = scores
+    dropped: list[str] = []
     result.missed_must_notice = map_to_rubric_items(
-        payload.get("missed_must_notice"), case.rubric.must_notice, case.case_id, "must_notice"
+        payload.get("missed_must_notice"), case.rubric.must_notice, case.case_id,
+        "must_notice", dropped,
     )
     result.overapplied = map_to_rubric_items(
-        payload.get("overapplied"), case.rubric.must_not_infer, case.case_id, "must_not_infer"
+        payload.get("overapplied"), case.rubric.must_not_infer, case.case_id,
+        "must_not_infer", dropped,
     )
     result.unacceptable_reasoning_hit = map_to_rubric_items(
         payload.get("unacceptable_reasoning_hit"),
         case.rubric.unacceptable_reasoning,
         case.case_id,
         "unacceptable_reasoning",
+        dropped,
     )
+    # Overapplication is a headline number, so the filter it passes through is reported
+    # beside it. A high dropped count means the rate below it is measured on a subset.
+    extra["dropped_rubric_flags"] = len(dropped)
+    extra["dropped_rubric_flag_examples"] = dropped[:5]
     if failures and failures == len(case.rubric.dimensions):
         # Nothing survived verification. The grading, not the answer, is what failed.
         result.technical_failure = (
@@ -464,12 +597,82 @@ async def judge_case(
 
 
 def judging_failures(result: CaseResult) -> int:
-    """How many dimensions were lost to a grading problem rather than to an inapplicability.
-
-    The report needs this to show "where the measurement itself is uncertain". It is derived
-    from the note prefixes rather than stored, because CaseResult is frozen contract.
-    """
+    """How many dimensions were lost to a grading problem rather than to an inapplicability."""
     return sum(1 for s in result.scores if s.score is None and s.note.startswith(JUDGING_FAILURE_PREFIX))
+
+
+def judging_failure_breakdown(result: CaseResult) -> dict[str, int]:
+    """Those failures counted by reason, so the report can say WHICH part of grading broke."""
+    known = (
+        NOTE_QUOTE_NOT_FOUND,
+        NOTE_QUOTE_TOO_SHORT,
+        NOTE_QUOTE_MISSING,
+        NOTE_JUDGE_OMITTED,
+        NOTE_BAD_SCORE,
+    )
+    counts: dict[str, int] = {}
+    for score in result.scores:
+        if score.score is not None or not score.note.startswith(JUDGING_FAILURE_PREFIX):
+            continue
+        reason = next(
+            (n[len(JUDGING_FAILURE_PREFIX):].strip() for n in known if score.note.startswith(n)),
+            "other",
+        )
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
+# `CaseResult.judging` is the real home for the grading diagnostics. The key below is the
+# old location under `answer_meta`, still written for this run only.
+JUDGING_RECORD_KEY = "judging"
+
+# TEMPORARY, remove after the 2026-09-09 evening run. A `main.py run` imports judge.py,
+# aggregate.py and render.py once at startup, so a reporting layer that has not yet picked up
+# the new field would read nothing if the record moved cleanly. Writing both locations makes
+# the run correct either way. The duplicate is the whole cost of that safety and it comes out
+# as soon as the run is done; `CaseResult.judging_record` already prefers the field, so
+# deleting the duplicate changes no reader.
+WRITE_LEGACY_JUDGING_COPY = True
+
+
+def judging_record(result: CaseResult) -> dict[str, Any]:
+    """The grading diagnostics for one result. Always present, possibly all zeros.
+
+    Delegates to the schema's own property, which prefers the field and falls back to the
+    legacy `answer_meta` copy, so this module has no second opinion about where to look.
+    """
+    return dict(result.judging_record or {})
+
+
+def set_judging_record(result: CaseResult, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Attach the grading diagnostics, derived from the scores plus whatever the caller saw.
+
+    Without this the counts existed only as a function nobody called, so an omitted score, an
+    out-of-range score, a missing quote and an unverifiable quote all landed in the same
+    column as a dimension that was correctly ruled inapplicable. Those are a broken
+    measurement and a correct exclusion, and averaging over a denominator that mixes them
+    understates the model on some cases and overstates the evaluation's reliability on all
+    of them.
+
+    Writes `CaseResult.judging`, and for this run also the legacy `answer_meta` copy. See
+    WRITE_LEGACY_JUDGING_COPY.
+    """
+    record: dict[str, Any] = {
+        "dimensions_failed": judging_failures(result),
+        "dimensions_inapplicable": sum(
+            1 for s in result.scores if s.score is None and s.note.startswith(NOTE_INAPPLICABLE)
+        ),
+        "dimensions_scored": len(result.scored),
+        "by_reason": judging_failure_breakdown(result),
+        "dropped_rubric_flags": 0,
+        "dropped_rubric_flag_examples": [],
+        "unrecognised_unscorable_field": "",
+    }
+    record.update(extra or {})
+    result.judging = record
+    if WRITE_LEGACY_JUDGING_COPY:
+        result.answer_meta = {**(result.answer_meta or {}), JUDGING_RECORD_KEY: dict(record)}
+    return record
 
 
 # ----------------------------------------------------------------------- judging a sweep
@@ -578,7 +781,12 @@ async def judge_cases(
         # Only now, after the judge has answered, does the arm exist in this data path.
         result.arm = str(row.get("arm", ""))
         result.model_id = str(row.get("model_id", ""))
+        # Merge, never replace. `result.judging` is unaffected by this assignment, but the
+        # legacy copy lives inside answer_meta and overwriting the dict wholesale is exactly
+        # what used to throw it away.
         result.answer_meta = dict(meta)
+        if WRITE_LEGACY_JUDGING_COPY:
+            result.answer_meta[JUDGING_RECORD_KEY] = dict(result.judging)
         return result
 
     try:
@@ -921,12 +1129,17 @@ __all__ = [
     "NOTE_QUOTE_MISSING",
     "NOTE_QUOTE_NOT_FOUND",
     "NOTE_QUOTE_TOO_SHORT",
+    "JUDGING_RECORD_KEY",
     "build_case_prompt",
+    "classify_unscorable",
     "judge_case",
     "judge_cases",
     "judge_change",
     "judge_changes",
+    "judging_failure_breakdown",
     "judging_failures",
+    "judging_record",
+    "set_judging_record",
     "map_to_rubric_items",
     "parse_scores",
     "render_dimensions",
