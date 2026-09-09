@@ -483,6 +483,11 @@ def _judge_role(config: RunConfig, name: str) -> ModelRole:
     return config.role("reviewer")
 
 
+# Public alias: form_control resolves roles the same way, and reaching across modules for a
+# private name is how two resolvers quietly drift apart.
+resolve_judge_role = _judge_role
+
+
 async def judge_cases(
     config: RunConfig,
     spec: Any,
@@ -908,6 +913,7 @@ async def judge_changes(
 __all__ = [
     "JUDGING_FAILURE_PREFIX",
     "SELF_CONSISTENCY",
+    "resolve_judge_role",
     "NOTE_BAD_SCORE",
     "NOTE_CASE_UNSCORABLE",
     "NOTE_INAPPLICABLE",

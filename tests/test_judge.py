@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import random
+import re
 
 import pytest
 
@@ -29,6 +30,14 @@ from persona_eval.run.answer import (
     resolve_settings,
     self_consistency_cases,
     settings_disagreement,
+)
+from persona_eval.run.form_control import (
+    FormPair,
+    SelfGradingError,
+    eligible_results,
+    measure_form_premium,
+    recast_answer,
+    summarise,
 )
 from persona_eval.run.deterministic import (
     CheckOutcome,
@@ -56,8 +65,10 @@ from persona_eval.run.judge import (
 from persona_eval.suite.schema import (
     Anchor,
     Case,
+    CaseResult,
     ChangeExpectation,
     DeterministicCheck,
+    DimensionScore,
     Family,
     Rubric,
     Suite,
@@ -1510,3 +1521,305 @@ def test_the_repeat_sample_does_not_depend_on_the_order_the_arms_were_passed_in(
 
     assert sample(forward) == sample(reversed_arms)
     assert len(sample(forward)) == 4
+
+
+# ============================================================== form-only control
+#
+# "Credit use, not mention" is an instruction and nothing measures whether the judge obeyed
+# it. Worse, quote verification is EASIER for the templated arm to satisfy, because its
+# scaffold hands the judge a clean quotable sentence per must_notice item. These tests pin
+# the control that measures the premium instead of asking for it not to exist.
+
+
+def graded(case_id="c_decide", arm="base", text=ANSWER, scores=(2, 1, 2), **kw):
+    result = CaseResult(
+        case_id=case_id, family_id="fam_error", task="decide", variant="original",
+        arm=arm, model_id=CANDIDATE_MODEL, answer_text=text,
+        scores=[DimensionScore(d, s) for d, s in zip(a_rubric().dimensions, scores)],
+    )
+    for key, value in kw.items():
+        setattr(result, key, value)
+    return result
+
+
+class FormClient(FakeClient):
+    """Answers recast, change and grading calls by the stage they came in on.
+
+    Grading quotes are taken from whichever text is actually inside the fence, so the real
+    quote verification runs for real instead of being sidestepped by the fake.
+    """
+
+    FENCED = re.compile(r">>>\n(.*?)\n<<<END_ANSWER_UNDER_TEST", re.S)
+
+    def __init__(self, recast="RECAST IN THE FOUR PART SHAPE", moved=False,
+                 recast_scores=(2, 2, 2), original_scores=(2, 1, 2),
+                 added_nothing=True, problem=""):
+        super().__init__()
+        self.recast, self.moved, self.problem = recast, moved, problem
+        self.added_nothing = added_nothing
+        self.recast_scores, self.original_scores = recast_scores, original_scores
+        self.stages: list[str] = []
+
+    async def complete_json(self, role, messages, **kwargs):
+        stage = str(kwargs.get("stage", ""))
+        self.stages.append(stage)
+        self.json_calls.append({"role": role, "messages": list(messages), **kwargs})
+        model = role.model if isinstance(role, ModelRole) else str(role)
+        if "recast" in stage:
+            payload = {"recast": self.recast, "added_nothing": self.added_nothing,
+                       "sections_the_reply_left_empty": [], "problem": self.problem}
+        elif "change" in stage:
+            payload = change_payload(self.moved)
+        else:
+            body = messages[-1]["content"]
+            match = self.FENCED.search(body)
+            graded_text = match.group(1) if match else ""
+            scores = (
+                self.recast_scores
+                if graded_text.strip() == self.recast.strip()
+                else self.original_scores
+            )
+            payload = good_payload()
+            for entry, value in zip(payload["scores"], scores):
+                entry["score"] = value
+                if value == 0:
+                    entry["quote"], entry["quote_basis"] = "", "absence"
+                else:
+                    entry["quote"], entry["quote_basis"] = graded_text[:80], "quote"
+        return payload, FakeResponse("{}", "stop", model)
+
+
+def form_config(tmp_path):
+    return a_config(tmp_path)
+
+
+def test_the_rewriter_may_not_be_the_judge(tmp_path):
+    """A model grading prose it wrote measures its own taste, not the format premium."""
+    config = a_config(tmp_path)
+    with pytest.raises(SelfGradingError) as error:
+        asyncio.run(
+            measure_form_premium(config, "SPEC", a_suite(), [graded()],
+                                 rewriter_role_name="judge", client=FormClient())
+        )
+    assert "judge-model-a" in str(error.value)
+
+
+def test_two_role_names_pointing_at_one_model_are_still_self_grading(tmp_path):
+    """The check is on the resolved model, not the role name, or it is trivially bypassed."""
+    config = a_config(tmp_path)
+    config.roles["judge_second"] = ModelRole(
+        name="judge_second", model="judge-model-a", api_key_source="none")
+    with pytest.raises(SelfGradingError):
+        asyncio.run(
+            measure_form_premium(config, "SPEC", a_suite(), [graded()], client=FormClient())
+        )
+
+
+def test_the_rewriter_never_sees_the_specification_or_the_rubric():
+    """Handed either, it writes toward the standard and the gap measures the answer key."""
+    client = FormClient()
+    asyncio.run(recast_answer(client, a_case(), ANSWER, "rewriter-model"))
+    prompt = "\n".join(client.prompts())
+    rubric = a_rubric()
+    assert "THE VALUE SPECIFICATION" not in prompt
+    for item in rubric.must_notice + rubric.acceptable_outputs:
+        assert item not in prompt
+    for dimension in rubric.dimensions:
+        assert f"### {dimension}" not in prompt
+    # It does see the question and the answer, fenced as untrusted evidence.
+    assert "What should the analyst do?" in prompt
+    assert ANSWER in prompt
+    assert "evidence to be" in prompt
+
+
+def test_the_rewrite_prompt_says_adding_anything_invalidates_it():
+    client = FormClient()
+    asyncio.run(recast_answer(client, a_case(), ANSWER, "rewriter-model"))
+    prompt = "\n".join(client.prompts())
+    assert "FORMATTING EXERCISE AND NOTHING ELSE" in prompt
+    assert "Adding a consideration the reply did not raise" in prompt
+    assert "Reaching a different conclusion" in prompt
+    assert "Do not finish its thinking for it" in prompt
+    assert "An empty section" in prompt
+
+
+def test_a_rewriter_that_admits_it_added_something_is_rejected():
+    client = FormClient(added_nothing=False, problem="had to supply a recommendation")
+    text, _empty, problem = asyncio.run(recast_answer(client, a_case(), ANSWER, "rewriter"))
+    assert text and "supply a recommendation" in problem
+
+
+def test_a_rewriter_that_refuses_is_a_usable_result():
+    client = FormClient(recast="", problem="cannot recast without adding")
+    text, _empty, problem = asyncio.run(recast_answer(client, a_case(), ANSWER, "rewriter"))
+    assert text == "" and "cannot recast" in problem
+
+
+def test_a_recast_that_moved_the_position_is_thrown_away_not_measured(tmp_path):
+    """The whole claim is that only the form changed. If it did not, there is nothing to read."""
+    premium = asyncio.run(
+        measure_form_premium(a_config(tmp_path), "SPEC", a_suite(), [graded()],
+                             client=FormClient(moved=True))
+    )
+    assert premium.n_usable == 0
+    assert premium.pairs[0].position_moved is True
+    assert "moved the position" in premium.pairs[0].rejected
+    assert premium.overall_gap is None
+
+
+def test_the_format_premium_is_the_paired_gap(tmp_path):
+    """Same substance, scaffolded shape, blind grading: the difference is the premium."""
+    suite = a_suite(cases=tuple(a_case(f"c_{i}") for i in range(12)))
+    results = [graded(f"c_{i}", scores=(1, 1, 1)) for i in range(12)]
+    premium = asyncio.run(
+        measure_form_premium(a_config(tmp_path), "SPEC", suite, results, n=12,
+                             client=FormClient(recast_scores=(2, 2, 2), original_scores=(1, 1, 1)))
+    )
+    assert premium.n_attempted == 12 and premium.n_usable == 12
+    assert premium.overall_gap == 1.0
+    assert premium.by_dimension["action_judgment"]["gap"] == 1.0
+    assert premium.by_dimension["action_judgment"]["mean_original"] == 1.0
+    assert premium.by_dimension["action_judgment"]["mean_recast"] == 2.0
+    assert premium.by_group["reasoning"]["gap"] == 1.0
+    assert premium.trustworthy is True
+
+
+def test_a_premium_of_zero_means_the_use_not_mention_control_held(tmp_path):
+    suite = a_suite(cases=tuple(a_case(f"c_{i}") for i in range(12)))
+    results = [graded(f"c_{i}", scores=(2, 1, 2)) for i in range(12)]
+    premium = asyncio.run(
+        measure_form_premium(a_config(tmp_path), "SPEC", suite, results, n=12,
+                             client=FormClient(recast_scores=(2, 1, 2), original_scores=(2, 1, 2)))
+    )
+    assert premium.overall_gap == 0.0
+    assert all(d["moved"] == 0 for d in premium.by_dimension.values())
+
+
+def test_the_original_is_regraded_in_the_same_batch_by_default(tmp_path):
+    """Otherwise the gap absorbs any drift between the main run's grading and this one."""
+    client = FormClient()
+    asyncio.run(
+        measure_form_premium(a_config(tmp_path), "SPEC", a_suite(), [graded()], client=client)
+    )
+    grading = [s for s in client.stages if s.startswith("run.judge.pass")]
+    assert len(grading) == 2
+    client2 = FormClient()
+    asyncio.run(
+        measure_form_premium(a_config(tmp_path), "SPEC", a_suite(), [graded()],
+                             rejudge_original=False, client=client2)
+    )
+    assert len([s for s in client2.stages if s.startswith("run.judge.pass")]) == 1
+
+
+def test_the_recast_is_graded_through_the_identical_judge_path(tmp_path):
+    """Same rubric, same anchors, same blindness. A different path would measure the path."""
+    client = FormClient()
+    asyncio.run(
+        measure_form_premium(a_config(tmp_path), "SPEC", a_suite(), [graded()], client=client)
+    )
+    grading = [c for c in client.json_calls if str(c["stage"]).startswith("run.judge.pass")]
+    body = grading[0]["messages"][-1]["content"]
+    for dimension in a_rubric().dimensions:
+        assert f"### {dimension}" in body
+    assert "credit use, not mention" in body
+    assert "base" not in body and CANDIDATE_MODEL not in body
+
+
+def test_only_gradeable_first_pass_answers_are_eligible():
+    pool = [
+        graded("ok"),
+        graded("broken", technical_failure="empty answer"),
+        graded("off_topic", unscorable="never addressed it"),
+        graded("repeat", judge_pass=1),
+        graded("blank", text="   "),
+        graded("unscored", scores=()),
+    ]
+    pool[5].scores = [DimensionScore("action_judgment", None)]
+    assert [r.case_id for r in eligible_results(pool)] == ["ok"]
+
+
+def test_eligible_results_can_be_filtered_to_one_arm():
+    pool = [graded("a", arm="base"), graded("b", arm=ARM_LABEL)]
+    assert [r.case_id for r in eligible_results(pool, arm="base")] == ["a"]
+
+
+def test_a_premium_from_too_few_survivors_is_not_trustworthy():
+    pairs = [
+        FormPair(case_id=f"c_{i}", family_id="f", task="decide", arm="base",
+                 original_text="a", recast_text="b",
+                 original_scores={"action_judgment": 1}, recast_scores={"action_judgment": 2})
+        for i in range(3)
+    ]
+    premium = summarise(pairs, attempted=20)
+    assert premium.overall_gap == 1.0
+    assert premium.n_usable == 3 and premium.trustworthy is False
+
+
+def test_rejections_are_counted_and_reported():
+    pairs = [
+        FormPair(case_id="a", family_id="f", task="decide", arm="base", original_text="x",
+                 recast_text="", rejected="no recast produced"),
+        FormPair(case_id="b", family_id="f", task="decide", arm="base", original_text="x",
+                 recast_text="y", rejected="the recast moved the position, so substance was not held constant"),
+    ]
+    premium = summarise(pairs, attempted=2)
+    assert premium.n_usable == 0
+    assert premium.rejected["no recast produced"] == 1
+    assert premium.rejected["the recast moved the position"] == 1
+
+
+def test_a_pair_needs_both_scores_on_a_dimension_to_contribute():
+    pair = FormPair(case_id="a", family_id="f", task="decide", arm="base",
+                    original_text="x", recast_text="y",
+                    original_scores={"action_judgment": 1, "proportionality": 2},
+                    recast_scores={"action_judgment": 2})
+    assert set(pair.paired) == {"action_judgment"}
+    assert summarise([pair], attempted=1).by_dimension["action_judgment"]["n"] == 1
+    assert "proportionality" not in summarise([pair], attempted=1).by_dimension
+
+
+def test_the_length_ratio_is_recorded_so_verbosity_is_separable(tmp_path):
+    """A scaffold that triples the length could be buying a verbosity effect, not a form one."""
+    long_recast = "word " * 300
+    premium = asyncio.run(
+        measure_form_premium(a_config(tmp_path), "SPEC", a_suite(), [graded()],
+                             client=FormClient(recast=long_recast))
+    )
+    pair = premium.pairs[0]
+    assert pair.words_original == count_words(ANSWER)
+    assert pair.length_ratio and pair.length_ratio > 5
+    assert premium.median_length_ratio == pair.length_ratio
+
+
+def test_an_empty_pool_returns_an_empty_measurement(tmp_path):
+    premium = asyncio.run(
+        measure_form_premium(a_config(tmp_path), "SPEC", a_suite(),
+                             [graded(technical_failure="empty answer")], client=FormClient())
+    )
+    assert premium.n_attempted == 0 and premium.overall_gap is None
+    assert premium.rewriter_model == "judge-model-b"
+
+
+def test_the_measurement_survives_a_rewriter_that_dies(tmp_path):
+    class Dead(FormClient):
+        async def complete_json(self, role, messages, **kwargs):
+            if "recast" in str(kwargs.get("stage", "")):
+                raise RuntimeError("rewriter 503")
+            return await super().complete_json(role, messages, **kwargs)
+
+    premium = asyncio.run(
+        measure_form_premium(a_config(tmp_path), "SPEC", a_suite(), [graded()], client=Dead())
+    )
+    assert premium.n_usable == 0
+    assert "rewriter 503" in premium.pairs[0].rejected
+
+
+def test_the_form_premium_serialises_for_the_report():
+    pair = FormPair(case_id="a", family_id="f", task="decide", arm="base", original_text="x",
+                    recast_text="y", original_scores={"action_judgment": 1},
+                    recast_scores={"action_judgment": 2}, words_original=10, words_recast=20)
+    payload = summarise([pair], attempted=1).to_dict()
+    assert payload["overall_gap"] == 1.0
+    assert payload["pairs"][0]["length_ratio"] == 2.0
+    assert payload["pairs"][0]["usable"] is True
+    assert payload["trustworthy"] is False

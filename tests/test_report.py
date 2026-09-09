@@ -635,13 +635,15 @@ def test_verbosity_falls_back_to_a_word_count_and_says_so() -> None:
 
 
 def test_position_bias_is_detected_when_verdicts_follow_the_order(basic_suite: Suite) -> None:
+    # Distinct families: six verdicts about the same probe would be one probe re-judged, which
+    # _split_verdicts collapses on purpose.
     verdicts = []
     for index in range(6):
         verdicts.append(
-            _verdict("fam_work", "paraphrase", "invariance", "base", True, order="original_first")
+            _verdict(f"famA{index}", "paraphrase", "invariance", "base", True, order="original_first")
         )
         verdicts.append(
-            _verdict("fam_far", "paraphrase", "invariance", "base", False, order="variant_first")
+            _verdict(f"famB{index}", "paraphrase", "invariance", "base", False, order="variant_first")
         )
     results = [make_result(basic_suite.case("fam_work.decide.original"), "base", {"action_judgment": 1})]
     analysis = analyse(basic_suite, results, verdicts)
@@ -659,9 +661,9 @@ def test_position_bias_is_detected_when_verdicts_follow_the_order(basic_suite: S
 
 def test_position_audit_flags_an_unbalanced_order_assignment(basic_suite: Suite) -> None:
     verdicts = [
-        _verdict("fam_work", "paraphrase", "invariance", "base", True, order="original_first")
-        for _ in range(10)
-    ] + [_verdict("fam_far", "paraphrase", "invariance", "base", False, order="variant_first")]
+        _verdict(f"famA{index}", "paraphrase", "invariance", "base", True, order="original_first")
+        for index in range(10)
+    ] + [_verdict("famB0", "paraphrase", "invariance", "base", False, order="variant_first")]
     results = [make_result(basic_suite.case("fam_work.decide.original"), "base", {"action_judgment": 1})]
     analysis = analyse(basic_suite, results, verdicts)
     pooled = next(a for a in analysis.position if a.arm == "all")

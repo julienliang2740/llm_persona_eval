@@ -85,6 +85,17 @@ def _signed(value: float | None, places: int = 2) -> str:
     return f"{value:+.{places}f}"
 
 
+def _rate(value: float | None, n: int) -> str:
+    """A percentage that carries its own warning when the denominator is too small.
+
+    Applied everywhere a percentage is printed. A bold 100% over two cases and a bold 100%
+    over sixty look identical on a page, and the first is the one a reader will quote.
+    """
+    if value is None:
+        return "-"
+    return f"{value:.0%}" + ("" if n >= MIN_CELL_N else "†")
+
+
 def _plural(count: int, singular: str, plural: str | None = None) -> str:
     """`3 families` / `1 family`. Counts appear in prose here, so they have to read as English."""
     return f"{count} {singular}" if count == 1 else f"{count} {plural or singular + 's'}"
@@ -209,6 +220,11 @@ def _how_to_read(analysis: Analysis) -> list[str]:
         f"Differences are reported as `arm - baseline`, so a negative number is a regression. "
         f"Where a comparison has fewer than {SMALL_N} paired cases it is labelled small, and the "
         f"better/worse/level counts should be read instead of the mean difference.",
+        "",
+        f"**A percentage marked † rests on fewer than {MIN_CELL_N} observations.** It is printed "
+        f"because hiding it would be worse, but it cannot support a conclusion: at that size one "
+        f"case moves the figure by twenty points or more. The marker is applied to every rate in "
+        f"this report, including the headline behaviour rates.",
     ]
     return lines
 
@@ -285,11 +301,13 @@ def _dimension_coverage(analysis: Analysis, suite: Suite) -> list[str]:
     if never_chosen:
         _verb, pronoun = agree(never_chosen)
         lines.append(
-            "**Sampling, not a gap.** "
+            "**A coverage gap.** "
             + ", ".join(never_chosen)
             + f" could have been scored and no rubric selected {pronoun}. Each rubric picks "
-            "three to five of the dimensions its task allows, so at this suite size some "
-            "reachable dimensions go unused. Read the absence as no evidence either way."
+            "three to five of the dimensions its task allows, and the coverage matrix does not "
+            "currently ensure every dimension is reached, so this is unintended rather than a "
+            "design choice. It is a gap to close in the suite, and no evidence either way about "
+            "any arm."
         )
     if not_returned:
         verb, pronoun = agree(not_returned)
@@ -354,23 +372,35 @@ def _diagnostic_scores(analysis: Analysis, suite: Suite) -> list[str]:
                 )
         lines += [
             "",
-            f"Pooled over the {group} dimensions above:",
+            f"Pooled over the {group} dimensions above, with the range the pooling hides:",
             "",
-            "| arm | mean | n observations | n cases | families | 0 | 1 | 2 |",
-            "|---|---|---|---|---|---|---|---|",
+            "| arm | mean | lowest dimension | highest dimension | n observations | n cases "
+            "| families | 0 | 1 | 2 |",
+            "|---|---|---|---|---|---|---|---|---|---|",
         ]
         for arm in analysis.arms:
             stat = analysis.group_stat(arm, group)
             if stat is None:
                 continue
+            means = [
+                (analysis.stat(arm, d).mean, d)
+                for d in dimensions
+                if analysis.stat(arm, d) is not None and analysis.stat(arm, d).mean is not None
+            ]
+            low = min(means, default=(None, "-"))
+            high = max(means, default=(None, "-"))
             lines.append(
-                f"| `{arm}` | **{_num(stat.mean)}** | {stat.n} | {stat.cases} | {stat.families} "
+                f"| `{arm}` | {_num(stat.mean)} | {_num(low[0])} ({low[1]}) "
+                f"| {_num(high[0])} ({high[1]}) | {stat.n} | {stat.cases} | {stat.families} "
                 f"| {stat.counts.get(0, 0)} | {stat.counts.get(1, 0)} | {stat.counts.get(2, 0)} |"
             )
         lines.append("")
         lines.append(
-            "The pooled row weights each dimension by how often it was scored, so it moves when "
-            "the task mix changes. The per-dimension table above it is the primary reading."
+            "The pooled mean is deliberately not emphasised. It weights each dimension by how "
+            "often it was scored, so it moves when the task mix changes, and averaging eight "
+            "dimensions into one number is the collapse this report exists to avoid. The "
+            "lowest and highest columns show how far apart the dimensions it covers actually "
+            "are; the per-dimension table above is the reading that means something."
         )
     lines += _dimension_coverage(analysis, suite)
     lines += _dimension_kind_matrix(analysis)

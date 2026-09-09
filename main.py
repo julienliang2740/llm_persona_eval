@@ -388,6 +388,99 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_form_control(args: argparse.Namespace) -> int:
+    """Measure what the tuned model's answer shape is worth, with substance held constant.
+
+    The judging prompt tells the judge to credit use rather than mention. Nothing else checks
+    that it obeyed, and the check that does exist, quote verification, is EASIER for an arm
+    whose template hands the judge a quotable sentence per rubric item. So this recasts
+    base-arm answers into that template without changing what they say, grades them blind
+    through the same path, and reports the gap. That gap is how much of any measured
+    advantage the shape alone explains.
+    """
+    from persona_eval.run.form_control import measure_form_premium
+
+    config = load_eval_config(args.config)
+    directory = runs.run_dir(args.run)
+    runs.configure_logging(directory, args.verbose)
+    suite = suite_io.load_suite(directory / runs.SUITE_COPY)
+    spec = load_spec(config, args.target, args.targets_dir)
+    results = _load_results(directory, args.arm)
+    if not results:
+        raise SystemExit(f"no graded results for arm {args.arm!r} in {directory}")
+
+    premium = await measure_form_premium(
+        config, spec, suite, results,
+        n=args.n, arm=args.arm,
+        rewriter_role_name=args.rewriter_role,
+        judge_role_name=args.judge_role,
+        usage_path=directory / runs.USAGE_FILE,
+    )
+    payload = premium.to_dict() if hasattr(premium, "to_dict") else premium
+    runs.write_json(directory / "form_premium.json", payload)
+    runs.record_stage(directory, "form_control", {"arm": args.arm, "n": args.n})
+    print(json.dumps(payload, indent=2, default=str)[:2500])
+    return 0
+
+
+async def cmd_rival(args: argparse.Namespace) -> int:
+    """Bound the author effect: re-grade the same answers against an independently written standard.
+
+    The two-judge audit measures judge contamination and is blind to author contamination,
+    which is the larger channel: one model wrote every situation, every rubric and every
+    anchor, and also decided which training rows survived review. Because both judges read
+    the same rubric, that taste cancels out of the comparison by construction. Here a model
+    that never saw the original standard writes a rival one from the same specification, and
+    the answers already collected are graded again against it. If the arms' gap is the same
+    size under both standards, the standard was not doing the work.
+    """
+    from persona_eval.suite.rival import (
+        author_rival_rubrics,
+        divergence_summary,
+        rival_suite,
+        select_rival_families,
+    )
+
+    config = load_eval_config(args.config)
+    directory = runs.run_dir(args.run)
+    runs.configure_logging(directory, args.verbose)
+    suite = suite_io.load_suite(directory / runs.SUITE_COPY)
+    spec = load_spec(config, args.target, args.targets_dir)
+    usage_path = directory / runs.USAGE_FILE
+
+    family_ids = select_rival_families(suite, fraction=args.fraction)
+    logger.info("rivalling %d of %d families: %s", len(family_ids), len(suite.families), ", ".join(family_ids))
+    rivals, rival_report = await author_rival_rubrics(
+        config, spec, suite, family_ids, role_name=args.rival_role, usage_path=usage_path
+    )
+    if not rivals:
+        raise SystemExit("no rival rubrics survived authoring; nothing to compare")
+    rivalled = rival_suite(suite, rivals)
+    rivalled_ids = set(rival_report.get("rivalled_case_ids") or [c.case_id for c in rivals])
+    suite_io.save_suite(rivalled, directory / "suite_rival.json")
+
+    # Grade the answers we already have against the rival standard. Nothing else moves: same
+    # answers, same judge, same dimensions, only the standard differs.
+    per_arm: dict[str, Any] = {}
+    for arm in runs.arms_present(directory):
+        answers = [a for a in runs.read_jsonl(runs.answers_path(directory, arm)) if a.get("case_id") in rivalled_ids]
+        if not answers:
+            continue
+        results = await judge_cases(
+            config, spec, rivalled, answers, judge_role_name=args.judge_role, usage_path=usage_path
+        )
+        runs.write_jsonl(directory / f"results_rival_{arm}.jsonl", results)
+        per_arm[arm] = len(results)
+
+    rival_report["divergence_summary"] = divergence_summary(rival_report.get("divergence") or [])
+    rival_report["rejudged"] = per_arm
+    runs.write_json(directory / "rival_report.json", rival_report)
+    runs.record_stage(directory, "rival", {"families": len(family_ids), "cases": len(rivalled_ids), "rejudged": per_arm})
+    print(json.dumps({"families": family_ids, "cases": len(rivalled_ids), "rejudged": per_arm,
+                      "divergence": rival_report["divergence_summary"]}, indent=2, default=str)[:1500])
+    return 0
+
+
 async def cmd_run(args: argparse.Namespace) -> int:
     """Everything, in order, one arm at a time.
 
@@ -561,6 +654,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--curator-judge", default=None)
     p.add_argument("--skip-capability", action="store_true")
 
+    p = common(sub.add_parser("form-control", help="measure what the tuned model's answer shape is worth on its own"))
+    p.add_argument("--run", required=True)
+    p.add_argument("--arm", default="base", help="the arm whose answers are recast; use the untuned one")
+    p.add_argument("--n", type=int, default=20)
+    p.add_argument("--rewriter-role", default="judge_second")
+    p.add_argument("--judge-role", default="judge")
+
+    p = common(sub.add_parser("rival", help="bound the author effect with an independently written rubric"))
+    p.add_argument("--run", required=True)
+    p.add_argument("--fraction", type=float, default=1 / 3)
+    p.add_argument("--rival-role", default="judge", help="model family that writes the rival standard; must differ from the author")
+    p.add_argument("--judge-role", default="judge")
+
     for name in ("evaluate", "compare"):
         p = common(sub.add_parser(name, help="legacy: single-score judging of a pipeline run's eval.jsonl"))
         p.set_defaults(config="configs/pilot.yaml")
@@ -589,6 +695,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(cmd_capability(args))
         if args.command == "report":
             return cmd_report(args)
+        if args.command == "form-control":
+            return asyncio.run(cmd_form_control(args))
+        if args.command == "rival":
+            return asyncio.run(cmd_rival(args))
         if args.command == "run":
             return asyncio.run(cmd_run(args))
         return asyncio.run(run_legacy(args))
