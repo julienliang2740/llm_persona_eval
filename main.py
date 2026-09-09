@@ -214,6 +214,7 @@ async def cmd_answer(args: argparse.Namespace) -> int:
         arm=args.arm,
         usage_path=directory / runs.USAGE_FILE,
         limit=args.limit,
+        **_self_consistency(args),
     )
     path = runs.answers_path(directory, args.arm)
     runs.write_jsonl(path, answers)
@@ -278,6 +279,25 @@ async def cmd_capability(args: argparse.Namespace) -> int:
     return 0
 
 
+def _self_consistency(args: argparse.Namespace) -> dict[str, Any]:
+    """The noise-floor probe, passed only when the installed answerer accepts it.
+
+    A value of 1 or more is a count of cases; a value below 1 is a fraction of the eligible
+    originals. Without this, an invariance rate has nothing to be read against: two answers
+    to a paraphrase are two draws from a model at temperature 0.7, and the probe measures how
+    often a position moves when the question did not change at all.
+    """
+    import inspect
+
+    value = getattr(args, "self_consistency", 0.0) or 0.0
+    if not value:
+        return {}
+    if "self_consistency" not in set(inspect.signature(answer_cases).parameters):
+        logger.warning("answer_cases does not accept self_consistency in this build; no noise floor will be measured")
+        return {}
+    return {"self_consistency": int(value) if value >= 1 else float(value)}
+
+
 def _change_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     """Optional judge_changes controls, passed only when the installed signature accepts them.
 
@@ -288,10 +308,7 @@ def _change_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     """
     import inspect
 
-    wanted = {
-        "repeat_fraction": getattr(args, "change_repeat_fraction", 0.0) or 0.0,
-        "self_consistency_fraction": getattr(args, "self_consistency", 0.0) or 0.0,
-    }
+    wanted = {"repeat_fraction": getattr(args, "change_repeat_fraction", 0.0) or 0.0}
     accepted = set(inspect.signature(judge_changes).parameters)
     passed = {k: v for k, v in wanted.items() if k in accepted and v}
     for key, value in wanted.items():
@@ -403,7 +420,8 @@ async def cmd_run(args: argparse.Namespace) -> int:
     for label, role in arms:
         logger.info("---- arm %s (role %s): answering %d cases", label, role, len(suite.cases))
         answers = await answer_cases(
-            config, suite, suite.cases, endpoint_role=role, arm=label, usage_path=usage_path, limit=args.limit
+            config, suite, suite.cases, endpoint_role=role, arm=label, usage_path=usage_path,
+            limit=args.limit, **_self_consistency(args),
         )
         runs.write_jsonl(runs.answers_path(directory, label), answers)
         runs.record_stage(
@@ -506,6 +524,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--arm", required=True)
     p.add_argument("--role", required=True)
     p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--self-consistency", type=float, default=0.0, help="answer this many originals twice (>=1 a count, <1 a fraction) for a noise floor")
 
     p = common(sub.add_parser("judge", help="grade one arm's answers and judge its variant changes"))
     p.add_argument("--run", required=True)
