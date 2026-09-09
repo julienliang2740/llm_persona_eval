@@ -461,7 +461,7 @@ async def cmd_rival(args: argparse.Namespace) -> int:
         raise SystemExit("no rival rubrics survived authoring; nothing to compare")
     rivalled = rival_suite(suite, rivals)
     rivalled_ids = set(rival_report.get("rivalled_case_ids") or [c.case_id for c in rivals])
-    suite_io.save_suite(rivalled, directory / "suite_rival.json")
+    suite_io.save_suite(rivalled, runs.rival_dir(directory) / runs.SUITE_COPY)
 
     # Grade the answers we already have against the rival standard. Nothing else moves: same
     # answers, same judge, same dimensions, only the standard differs.
@@ -478,12 +478,12 @@ async def cmd_rival(args: argparse.Namespace) -> int:
         # a single mean, averaging away the very comparison this command exists to make.
         for result in results:
             result.standard = "rival"
-        runs.write_jsonl(directory / f"results_rival_{arm}.jsonl", results)
+        runs.write_jsonl(runs.results_path(runs.rival_dir(directory), arm), results)
         per_arm[arm] = len(results)
 
     rival_report["divergence_summary"] = divergence_summary(rival_report.get("divergence") or [])
     rival_report["rejudged"] = per_arm
-    runs.write_json(directory / "rival_report.json", rival_report)
+    runs.write_json(runs.rival_dir(directory) / "rival_report.json", rival_report)
     runs.record_stage(directory, "rival", {"families": len(family_ids), "cases": len(rivalled_ids), "rejudged": per_arm})
     print(json.dumps({"families": family_ids, "cases": len(rivalled_ids), "rejudged": per_arm,
                       "divergence": rival_report["divergence_summary"]}, indent=2, default=str)[:1500])

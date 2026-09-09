@@ -531,6 +531,48 @@ def divergence_summary(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+#: What a score was graded against. `unknown` means the result predates the rival pass or
+#: names a rubric version neither standard produced, which is a defect, not a third standard.
+ORIGINAL, RIVAL, UNKNOWN = "original", "rival", "unknown"
+
+
+def standard_labels(report: dict[str, Any]) -> dict[str, dict[str, str]]:
+    """{case_id: {rubric_version: "original" | "rival"}}, from a rival report.
+
+    A CaseResult records `rubric_version` but nothing naming which standard produced it, so
+    scores graded against two different standards would otherwise pool into one mean in
+    silence. That is the worst available failure: it would not error, it would not look odd,
+    and it would quietly average a measurement with its own control.
+
+    Keyed by case first because a rival rubric that came back word for word identical shares
+    its original's version hash. Same version, same case, same score, so the label is
+    ambiguous only where it cannot matter, and `divergence_summary` already warns when that
+    happens at all.
+    """
+    labels: dict[str, dict[str, str]] = {}
+    for row in report.get("divergence") or []:
+        case_id = str(row.get("case_id", ""))
+        if not case_id:
+            continue
+        versions = labels.setdefault(case_id, {})
+        original = str(row.get("original_rubric_version", ""))
+        rival = str(row.get("rival_rubric_version", ""))
+        if original:
+            versions[original] = ORIGINAL
+        if rival:
+            # An identical rival must not overwrite the original's label: where the two hashes
+            # collide the standards are the same text, so `original` is the truthful answer.
+            versions.setdefault(rival, RIVAL)
+    return labels
+
+
+def label_result(
+    labels: dict[str, dict[str, str]], case_id: str, rubric_version: str
+) -> str:
+    """Which standard one CaseResult was graded against. Never guesses."""
+    return labels.get(case_id, {}).get(rubric_version, UNKNOWN)
+
+
 def rival_suite(suite: Suite, rivals: Sequence[Case]) -> Suite:
     """The same suite with the rival standard swapped in, for the second judging pass.
 
@@ -545,6 +587,11 @@ def rival_suite(suite: Suite, rivals: Sequence[Case]) -> Suite:
 
 __all__ = [
     "LOW_DIVERGENCE",
+    "ORIGINAL",
+    "RIVAL",
+    "UNKNOWN",
+    "label_result",
+    "standard_labels",
     "PINNED_FIELDS",
     "RIVALLED_FIELDS",
     "RivalError",

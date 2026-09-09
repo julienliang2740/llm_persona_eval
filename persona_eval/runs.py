@@ -18,6 +18,8 @@ Layout:
       report.md              the rendered report
       usage.jsonl            every model call and its cost
       log.txt
+      rival/                 the same answers graded against an independently written
+                             standard: suite.json, results_<arm>.jsonl, rival_report.json
 
 Arms are named, not numbered: `base` and `adapter` here, but a third checkpoint would just
 be another arm and nothing in the layout changes.
@@ -85,9 +87,29 @@ def capability_path(directory: Path, arm: str) -> Path:
     return directory / f"capability_{arm}.jsonl"
 
 
+#: Results produced against a rival standard live here rather than beside the run's own
+#: results. A flat `results_rival_<arm>.jsonl` would be globbed by `arms_present` and returned
+#: as an arm named "rival_base", so a report after a rival pass would show four arms, two of
+#: them fictitious, and present the same two models graded against a different standard as if
+#: they were different models. A directory makes which standard produced a score a property of
+#: where it lives, which cannot be misread.
+RIVAL_DIR = "rival"
+
+
 def arms_present(directory: Path, prefix: str = "results") -> list[str]:
-    """Which arms this run has files for, e.g. ['adapter', 'base']."""
+    """Which arms this run has files for, e.g. ['adapter', 'base'].
+
+    Only the run's own results, never a nested standard's: `glob` does not descend, so the
+    rival directory is invisible here by construction rather than by a name filter that a
+    legitimately-named arm could trip over.
+    """
     return sorted(p.stem[len(prefix) + 1 :] for p in directory.glob(f"{prefix}_*.jsonl"))
+
+
+def rival_dir(directory: Path) -> Path:
+    path = directory / RIVAL_DIR
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 # --------------------------------------------------------------------------- persistence

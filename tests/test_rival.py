@@ -498,3 +498,39 @@ def test_select_rival_families_is_stratified_and_deterministic():
     assert len(select_rival_families(suite, fraction=1.0)) == len(families)
     with pytest.raises(RivalError):
         select_rival_families(suite, fraction=0)
+
+
+# ------------------------------------------------------------- labelling a graded result
+
+
+async def test_standard_labels_tell_the_two_standards_apart(toy_spec, pilot_config):
+    """A CaseResult names a rubric version but not a standard, so the report needs this map."""
+    from persona_eval.suite.rival import label_result, standard_labels
+
+    suite, rivals, report, _client = await _rival(toy_spec, pilot_config)
+    labels = standard_labels(report)
+
+    for rival in rivals:
+        original = suite.case(rival.case_id)
+        assert label_result(labels, rival.case_id, original.rubric.version) == "original"
+        assert label_result(labels, rival.case_id, rival.rubric.version) == "rival"
+
+    # It never guesses: an unseen version or an unrivalled case is "unknown", not a default.
+    assert label_result(labels, "c_decide_original", "deadbeef") == "unknown"
+    assert label_result(labels, "c_never_rivalled", "whatever") == "unknown"
+    assert standard_labels({}) == {}
+
+
+async def test_an_identical_rival_is_labelled_original_rather_than_ambiguously(
+    toy_spec, pilot_config
+):
+    """Where the two hashes collide the standards are the same text, so `original` is true."""
+    from persona_eval.suite.rival import label_result, standard_labels
+
+    report = {
+        "divergence": [
+            {"case_id": "c1", "original_rubric_version": "same", "rival_rubric_version": "same"}
+        ]
+    }
+    labels = standard_labels(report)
+    assert label_result(labels, "c1", "same") == "original"

@@ -102,3 +102,18 @@ def test_case_seed_is_stable_and_arm_independent():
     assert case_seed("case-1") == case_seed("case-1")
     assert case_seed("case-1") != case_seed("case-2")
     assert 0 <= case_seed("case-1") < 2**32
+
+
+def test_arms_present_ignores_results_graded_against_another_standard(tmp_path: Path):
+    # The bug: a flat results_rival_<arm>.jsonl was globbed and returned as an arm called
+    # "rival_base", so a report after a rival pass showed four arms, two of them fictitious,
+    # and presented the same two models under a different standard as different models.
+    from persona_eval.runs import rival_dir
+
+    directory = run_dir("r1", tmp_path)
+    for arm in ("base", "adapter"):
+        write_jsonl(results_path(directory, arm), [{"case_id": "c1"}])
+        write_jsonl(results_path(rival_dir(directory), arm), [{"case_id": "c1", "standard": "rival"}])
+    assert arms_present(directory) == ["adapter", "base"]
+    # The rival directory is a complete parallel set, addressed the same way.
+    assert arms_present(rival_dir(directory)) == ["adapter", "base"]

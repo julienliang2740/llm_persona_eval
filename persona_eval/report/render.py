@@ -605,9 +605,22 @@ def _behaviour(analysis: Analysis) -> list[str]:
             lines += [
                 "The first row for each arm is its noise floor: the same question asked twice "
                 "with nothing changed, and how often the arm gave the same answer. Every rate "
-                "below it is built on top of that. An arm that reproduces its own position only "
-                "seven times in ten cannot demonstrate invariance at seven in ten, because it "
-                "would score that by doing nothing.",
+                "below it is built on top of that.",
+                "",
+                "The floor points in opposite directions for the two kinds of probe, so there "
+                "are two of them.",
+                "",
+                "- **invariance and resistance** expect the position to hold. The floor is the "
+                "consistency rate itself: an arm that reproduces its own position only seven "
+                "times in ten cannot demonstrate invariance at seven in ten, because it would "
+                "score that by doing nothing.",
+                "- **sensitivity and legitimate update** expect the position to move. The floor "
+                "is one minus the consistency rate: an arm that is inconsistent three times in "
+                "ten already scores three in ten on a must-move probe by changing its answer at "
+                "random, having demonstrated nothing.",
+                "",
+                "Moving when the facts move is only evidence if the arm stays put when they do "
+                "not, which is why both floors come from the same probe.",
                 "",
             ]
         else:
@@ -1378,25 +1391,35 @@ def _format_premium_section(analysis: Analysis) -> list[str]:
             f"| {premium.level} | {premium.cases}{' (small)' if premium.small_sample else ''} "
             f"| {premium.families} | {_p(premium.p_value)} |"
         )
+    lines += _premium_provenance(sample)
     material = [premium for premium in analysis.format_premium if premium.material]
+    detail = "; ".join(
+        f"{_signed(premium.premium)} on {premium.group}" for premium in analysis.format_premium
+    )
+    lines.append("")
+    # Printed with the same shape whichever way it came out. If the sentence only appeared when
+    # the premium was large, its presence would leak the result and a reader would learn to read
+    # the heading rather than the number.
+    lines.append(
+        f"**The shape alone is worth {detail}**, on the 0-2 scale, over "
+        f"{_plural(sample.cases, 'case')} both graded blind."
+    )
     lines.append("")
     if material:
-        detail = "; ".join(
-            f"{_signed(premium.premium)} on {premium.group}" for premium in material
-        )
         lines.append(
-            f"**The shape alone is worth {detail}.** The same substance, rewritten into the "
-            f"adapted model's format, scores that much higher from a judge that could not see "
-            f"which was which. Any gain the adapted arm shows on those groups that is no larger "
-            f"than this premium is a gain the format explains, not a change in judgment."
+            "That clears the "
+            f"{MATERIAL_PREMIUM:.2f} bar this report calls material. The same substance, "
+            "rewritten into the adapted model's format, scores that much higher from a judge "
+            "that could not see which was which. Any gain the adapted arm shows on those groups "
+            "that is no larger than this premium is a gain the format explains, not a change in "
+            "judgment."
         )
     else:
         lines.append(
-            f"**No material format premium.** Recasting the substance into the adapted shape "
-            f"moved the score by less than {MATERIAL_PREMIUM:.2f} on the 0-2 scale, so the "
-            f"differences reported above are not obviously explained by presentation. The "
-            f"sample is {_plural(sample.cases, 'case')}, small enough that a premium of this "
-            f"size could still be missed."
+            f"That is below the {MATERIAL_PREMIUM:.2f} bar this report calls material, so the "
+            f"differences reported above are not obviously explained by presentation. The sample "
+            f"is small enough that a premium of this size could still be missed, so this is weak "
+            f"evidence of absence rather than evidence the format is worth nothing."
         )
     lines += [
         "",
@@ -1405,6 +1428,64 @@ def _format_premium_section(analysis: Analysis) -> list[str]:
         "substance can still be moved by a well-organised answer. Holding the substance fixed "
         "and varying only the shape is what separates the two.",
     ]
+    return lines
+
+
+def _premium_provenance(sample) -> list[str]:
+    """How much of the attempted control survived, and against what baseline it was measured.
+
+    A premium computed over four surviving pairs out of twenty is a leftover, not a
+    measurement, and the survival rate is the only thing on the page that says so.
+    """
+    lines: list[str] = []
+    if sample.attempted:
+        survival = sample.survival_rate
+        lines += [
+            "",
+            f"{sample.usable} of {_plural(sample.attempted, 'attempted recast')} were usable "
+            f"({_rate(survival, sample.usable)}). A recast that moved the position, failed to "
+            f"grade, or that the rewriter declined is discarded before it reaches this table, so "
+            f"the premium is never computed over rewrites that changed the substance.",
+        ]
+        if sample.rejected:
+            lines.append("")
+            lines.append(
+                "Rejected for: "
+                + ", ".join(f"{reason} x{count}" for reason, count in sample.rejected)
+                + "."
+            )
+        if sample.trustworthy is False:
+            lines.append("")
+            lines.append(
+                "**The judging module marks this premium untrustworthy** on its own thresholds "
+                "for usable pairs and survival rate. Read the number as an indication that the "
+                "control needs rerunning, not as a measurement."
+            )
+    if sample.median_length_ratio is not None:
+        lines += [
+            "",
+            f"Median length ratio, recast over original: **{sample.median_length_ratio:.2f}**. "
+            + (
+                "The recast answers are substantially longer, so a positive premium here has two "
+                "candidate causes and this ratio is what separates a verbosity effect from a form "
+                "effect. Read it next to the verbosity audit."
+                if sample.median_length_ratio >= 1.25
+                else "The two are close in length, so the premium is unlikely to be a verbosity "
+                "effect in disguise."
+            ),
+        ]
+    if sample.baseline_source:
+        lines += [
+            "",
+            f"Baseline for the comparison: {sample.baseline_source}."
+            + (
+                " The untouched answer was re-graded in the same batch as its recast, so drift "
+                "between two grading passes is not attributed to the scaffold."
+                if sample.baseline_source == "in-batch re-grade"
+                else " The source arm's main-run scores were used, so a small part of this gap "
+                "may be drift between grading passes rather than the scaffold."
+            ),
+        ]
     return lines
 
 

@@ -457,7 +457,10 @@ class IntegrityStat:
     truncated_and_lost: int = 0
     judging_failures: int = 0
     inapplicable_dimensions: int = 0
+    dropped_rubric_flags: int = 0
     deterministic_errors: int = 0
+    judging_failure_reasons: tuple[tuple[str, int], ...] = ()
+    dropped_flag_examples: tuple[str, ...] = ()
     unscorable_reasons: tuple[tuple[str, int], ...] = ()
     technical_reasons: tuple[tuple[str, int], ...] = ()
     unscorable_cases: tuple[str, ...] = ()
@@ -527,6 +530,16 @@ class FormatPremium:
     level: int
     p_value: float | None
     small_sample: bool
+    baseline_source: str = ""  # "in-batch re-grade" | "main-run scores" | "mixed"
+    attempted: int = 0
+    usable: int = 0
+    rejected: tuple[tuple[str, int], ...] = ()
+    trustworthy: bool | None = None
+    median_length_ratio: float | None = None
+
+    @property
+    def survival_rate(self) -> float | None:
+        return (self.usable / self.attempted) if self.attempted else None
 
     @property
     def material(self) -> bool:
@@ -1989,13 +2002,51 @@ def was_truncated(result: CaseResult) -> bool:
     return bool(meta.get("hit_token_limit"))
 
 
-def _note_counts(result: CaseResult) -> tuple[int, int]:
-    """(judging failures, correctly inapplicable) among this result's unscored dimensions.
+def judging_record(result: CaseResult) -> Mapping[str, Any]:
+    """The grading record, through the schema's accessor when the result has one.
 
-    A dimension the rubric never applied to the task and a dimension the judge fumbled both
-    show up as a None score. Only the second is a measurement problem, and conflating them
-    hides how much of the suite the grading actually lost.
+    The judging team moved this onto its own field partway through, and the property prefers
+    the field while falling back to the older answer_meta location. Reading through it rather
+    than either location directly is what lets one report cover results written on both sides
+    of that change.
     """
+    getter = getattr(result, "judging_record", None)
+    if isinstance(getter, Mapping):
+        return getter
+    meta = result.answer_meta if isinstance(result.answer_meta, Mapping) else {}
+    record = meta.get("judging")
+    return record if isinstance(record, Mapping) else {}
+
+
+def _as_count(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, (list, tuple, dict, set)):
+        return len(value)
+    return 0
+
+
+def _note_counts(result: CaseResult) -> tuple[int, int, int]:
+    """(judging failures, correctly inapplicable, dropped rubric flags) for one result.
+
+    A dimension the task cannot express and a dimension the judge fumbled both arrive as a
+    None score. Only the second is a hole in the measurement, and conflating them hides how
+    much of the run the grading actually lost.
+
+    The judging record is authoritative when present, because it counts things the notes
+    cannot show: a judge flag that matched no rubric item leaves no DimensionScore behind at
+    all. Falling back to the note prefixes keeps results written before that field existed.
+    """
+    record = judging_record(result)
+    dropped_flags = _as_count(record.get("dropped_rubric_flags"))
+    if "dimensions_failed" in record or "dimensions_inapplicable" in record:
+        return (
+            _as_count(record.get("dimensions_failed")),
+            _as_count(record.get("dimensions_inapplicable")),
+            dropped_flags,
+        )
     failures = inapplicable = 0
     for score in _scores_of(result):
         if score.score is not None:
@@ -2005,7 +2056,7 @@ def _note_counts(result: CaseResult) -> tuple[int, int]:
             failures += 1
         elif note.startswith(INAPPLICABLE_PREFIX):
             inapplicable += 1
-    return failures, inapplicable
+    return failures, inapplicable, dropped_flags
 
 
 def _deterministic_errors(result: CaseResult) -> int:
@@ -2026,11 +2077,24 @@ def _integrity(primary: Sequence[CaseResult], arms: Sequence[str]) -> tuple[Inte
         technical = [r for r in subset if r.technical_failure]
         graded = [r for r in subset if is_graded(r)]
         truncated = [r for r in subset if was_truncated(r)]
-        failures = inapplicable = 0
+        failures = inapplicable = dropped_flags = 0
+        reasons: Counter[str] = Counter()
+        flag_examples: list[str] = []
         for result in subset:
-            case_failures, case_inapplicable = _note_counts(result)
+            case_failures, case_inapplicable, case_flags = _note_counts(result)
             failures += case_failures
             inapplicable += case_inapplicable
+            dropped_flags += case_flags
+            record = judging_record(result)
+            by_reason = record.get("by_reason")
+            if isinstance(by_reason, Mapping):
+                for reason, count in by_reason.items():
+                    reasons[str(reason)] += _as_count(count)
+            examples = record.get("dropped_rubric_flag_examples")
+            if isinstance(examples, (list, tuple)):
+                flag_examples.extend(str(item) for item in examples)
+            if record.get("unrecognised_unscorable_field"):
+                reasons["unrecognised unscorable field"] += 1
         stats.append(
             IntegrityStat(
                 arm=arm,
@@ -2044,6 +2108,9 @@ def _integrity(primary: Sequence[CaseResult], arms: Sequence[str]) -> tuple[Inte
                 truncated_and_lost=sum(1 for r in truncated if not is_graded(r)),
                 judging_failures=failures,
                 inapplicable_dimensions=inapplicable,
+                dropped_rubric_flags=dropped_flags,
+                judging_failure_reasons=_top(reasons),
+                dropped_flag_examples=tuple(flag_examples[:6]),
                 deterministic_errors=sum(_deterministic_errors(r) for r in subset),
                 unscorable_reasons=_top(Counter(str(r.unscorable) for r in unscorable)),
                 technical_reasons=_top(Counter(str(r.technical_failure) for r in technical)),
@@ -2132,22 +2199,72 @@ def _verdict_stability(
     return tuple(out)
 
 
+def _unwrap_form_control(
+    form_control: Any,
+) -> tuple[Sequence[Any], Mapping[str, Any]]:
+    """Accept the judging team's FormPremium object, its dict, or a bare list of rows.
+
+    The trust metadata lives on the premium object rather than on the rows, and a premium over
+    four survivors out of twenty is a leftover rather than a measurement, so it is worth taking
+    the whole object when the caller has one.
+    """
+    if form_control is None:
+        return ((), {})
+    rows = getattr(form_control, "recast_rows", None)
+    if rows is None and isinstance(form_control, Mapping):
+        rows = form_control.get("recast_rows")
+    if rows is None:
+        return (form_control, {})
+    if isinstance(form_control, Mapping):
+        meta = {k: v for k, v in form_control.items() if k != "recast_rows"}
+    else:
+        meta = {
+            key: getattr(form_control, key)
+            for key in (
+                "n_attempted",
+                "n_usable",
+                "rejected",
+                "trustworthy",
+                "median_length_ratio",
+                "overall_gap",
+            )
+            if hasattr(form_control, key)
+        }
+    return (rows, meta)
+
+
+def _group_mean_of(scores: Mapping[str, Any], group: str) -> tuple[float | None, int]:
+    """Group mean over an already-extracted dimension-to-score map."""
+    wanted = DIMENSION_GROUPS.get(group, frozenset())
+    values: list[float] = []
+    for name, value in scores.items():
+        if name in wanted and isinstance(value, (int, float)) and not isinstance(value, bool):
+            values.append(float(value))
+    return (_mean(values), len(values))
+
+
 def _format_premium(
     primary: Sequence[CaseResult],
-    form_control: Sequence[Any] | None,
+    form_control: Any,
     baseline_arm: str | None,
     notes: list[str],
 ) -> tuple[FormatPremium, ...]:
     """Baseline answers recast into the adapted arm's shape, judged blind on the same rubric.
 
-    Rows may be CaseResults or the dicts they serialise to. The arm they were recast from comes
-    from `answer_meta["form_control_of"]` when the judging team records it, and falls back to
-    the baseline arm.
+    Rows may be CaseResults or the dicts they serialise to, and the caller may hand over the
+    whole FormPremium object instead.
+
+    Where a row carries `answer_meta["form_control_baseline_scores"]`, that in-batch re-grade of
+    the untouched answer is preferred over the source arm's main-run scores. The judging module
+    re-grades the original alongside its recast so that drift between two grading passes is not
+    attributed to the scaffold, and using the same baseline makes this report's premium equal
+    the number that module publishes rather than differing from it by a hair.
     """
-    if not form_control:
+    rows_in, meta = _unwrap_form_control(form_control)
+    if not rows_in:
         return ()
     recast: list[CaseResult] = []
-    for row in form_control:
+    for row in rows_in:
         if isinstance(row, CaseResult):
             recast.append(row)
         elif isinstance(row, Mapping):
@@ -2180,17 +2297,36 @@ def _format_premium(
 
     original = {r.case_id: r for r in primary if r.arm == source_arm and is_graded(r)}
     label = recast[0].arm or "recast"
+    rejected = meta.get("rejected")
+    rejected_pairs = (
+        tuple(sorted(((str(k), _as_count(v)) for k, v in rejected.items()), key=lambda kv: -kv[1]))
+        if isinstance(rejected, Mapping)
+        else ()
+    )
+    trustworthy = meta.get("trustworthy")
+    ratio = meta.get("median_length_ratio")
+
     out: list[FormatPremium] = []
     for group in ("action", "reasoning"):
         pairs: list[tuple[str, str, float, float]] = []
+        sources: Counter[str] = Counter()
         for row in recast:
-            base = original.get(row.case_id)
-            if base is None:
-                continue
-            base_mean, base_n = group_mean(base, group)
+            in_batch = (row.answer_meta or {}).get("form_control_baseline_scores")
+            if isinstance(in_batch, Mapping) and in_batch:
+                base_mean, base_n = _group_mean_of(in_batch, group)
+                family_id = row.family_id
+                origin = "in-batch re-grade"
+            else:
+                base = original.get(row.case_id)
+                if base is None:
+                    continue
+                base_mean, base_n = group_mean(base, group)
+                family_id = base.family_id
+                origin = "main-run scores"
             recast_mean, recast_n = group_mean(row, group)
             if base_n and recast_n and base_mean is not None and recast_mean is not None:
-                pairs.append((row.case_id, base.family_id, base_mean, recast_mean))
+                pairs.append((row.case_id, family_id, base_mean, recast_mean))
+                sources[origin] += 1
         if not pairs:
             continue
         change = _paired_change(
@@ -2211,6 +2347,16 @@ def _format_premium(
                 level=change.level,
                 p_value=change.p_value,
                 small_sample=change.small_sample,
+                baseline_source=(
+                    sources.most_common(1)[0][0] if len(sources) == 1 else "mixed"
+                ),
+                attempted=_as_count(meta.get("n_attempted")),
+                usable=_as_count(meta.get("n_usable")) or change.paired,
+                rejected=rejected_pairs,
+                trustworthy=trustworthy if isinstance(trustworthy, bool) else None,
+                median_length_ratio=(
+                    float(ratio) if isinstance(ratio, (int, float)) and not isinstance(ratio, bool) else None
+                ),
             )
         )
     if not out:
