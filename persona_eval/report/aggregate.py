@@ -2940,7 +2940,9 @@ def analyse(
     baseline_arm: str | None = None,
     max_worst_examples: int = 12,
     curator_judge: str | None = None,
-    form_control: Sequence[Any] | None = None,
+    form_control: Any = None,
+    rival_results: Sequence[CaseResult] | None = None,
+    rival_report: Mapping[str, Any] | None = None,
 ) -> Analysis:
     """Compute every table the report shows, from one run's grading records.
 
@@ -2955,7 +2957,13 @@ def analyse(
     verdicts = list(verdicts or ())
     notes: list[str] = []
 
-    primary, repeats = _split_passes(results, notes)
+    # Standard first, then pass. A rival-graded score must not reach a per-dimension mean even
+    # if it arrived in the same list, so the population is decided before anything else.
+    own_standard, rival_rows = _split_standards(results, notes)
+    if rival_results:
+        extra_original, extra_rival = _split_standards(list(rival_results), [])
+        rival_rows = list(rival_rows) + list(extra_rival) + list(extra_original)
+    primary, repeats = _split_passes(own_standard, notes)
     primary_verdicts, repeat_verdicts = _split_verdicts(verdicts, notes)
     arms = _arm_order(primary or results, baseline_arm, primary_verdicts)
     baseline = _pick_baseline(arms, baseline_arm)
@@ -3013,9 +3021,17 @@ def analyse(
     verdict_stability = _verdict_stability(primary_verdicts, repeat_verdicts)
     pairing_losses = _pairing_losses(primary, arms, baseline)
     format_premium = _format_premium(primary, form_control, baseline, notes)
+    author_effect = _author_effect(primary, rival_rows, arms, baseline, notes)
+    divergence = _rubric_divergence(rival_report)
+    _phantom_arm_note(arms, notes)
     capability_stats = _capability(capability, notes)
     deterministic = _deterministic(primary, arms)
 
+    if rival_rows and divergence is not None and divergence.degenerate:
+        notes.append(
+            "Every rival rubric came back at or below the divergence floor, so the author-effect "
+            "comparison is between two versions of the same standard and measures nothing."
+        )
     if not repeats:
         notes.append(
             "No case was judged twice, so this run carries no measurement of the judge's "
@@ -3073,6 +3089,10 @@ def analyse(
         integrity=integrity,
         pairing_losses=pairing_losses,
         format_premium=format_premium,
+        author_effect=author_effect,
+        rubric_divergence=divergence,
+        rival_cases=len({r.case_id for r in rival_rows}),
+        rival_families=len({r.family_id for r in rival_rows}),
         family_counts=family_counts,
         verbosity=verbosity,
         position=position,
@@ -3109,6 +3129,8 @@ __all__ = [
     "IntegrityStat",
     "JudgeCoverage",
     "JudgeDivergence",
+    "MATERIAL_AUTHOR_EFFECT",
+    "MATERIAL_DELTA",
     "MATERIAL_DID",
     "MATERIAL_PREMIUM",
     "MOVE_MEASURES",
@@ -3118,6 +3140,9 @@ __all__ = [
     "PairingLoss",
     "PositionAudit",
     "ReliabilityStat",
+    "RubricDivergence",
+    "STANDARD_ORIGINAL",
+    "STANDARD_RIVAL",
     "SELF_CONSISTENCY",
     "SMALL_N",
     "VerbosityAudit",
@@ -3131,6 +3156,7 @@ __all__ = [
     "group_mean",
     "group_of",
     "is_graded",
+    "judging_record",
     "was_truncated",
     "pearson",
     "sign_test_p",

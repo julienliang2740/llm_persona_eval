@@ -31,6 +31,7 @@ from typing import Any, Mapping, Sequence
 
 from persona_eval.report.aggregate import (
     GROUP_MEANING,
+    MATERIAL_AUTHOR_EFFECT,
     MATERIAL_DID,
     MATERIAL_PREMIUM,
     SELF_CONSISTENCY,
@@ -1426,9 +1427,14 @@ def _format_premium_section(analysis: Analysis) -> list[str]:
     # Printed with the same shape whichever way it came out. If the sentence only appeared when
     # the premium was large, its presence would leak the result and a reader would learn to read
     # the heading rather than the number.
+    because = (
+        ", each original re-graded alongside its own recast so that only the form differs"
+        if sample.baseline_source == "in-batch re-grade"
+        else ", paired against the main run's scores, so a little grading drift may be folded in"
+    )
     lines.append(
         f"**The shape alone is worth {detail}**, on the 0-2 scale, over "
-        f"{_plural(sample.cases, 'case')} both graded blind."
+        f"{_plural(sample.cases, 'case')} both graded blind{because}."
     )
     lines.append("")
     if material:
@@ -1480,12 +1486,23 @@ def _premium_provenance(sample) -> list[str]:
                 + ", ".join(f"{reason} x{count}" for reason, count in sample.rejected)
                 + "."
             )
+        lines.append("")
         if sample.trustworthy is False:
-            lines.append("")
             lines.append(
                 "**The judging module marks this premium untrustworthy** on its own thresholds "
                 "for usable pairs and survival rate. Read the number as an indication that the "
                 "control needs rerunning, not as a measurement."
+            )
+        elif sample.trustworthy is True:
+            lines.append(
+                "The judging module marks this premium trustworthy on its own thresholds for "
+                "usable pairs and survival rate. Stated either way, so that silence here never "
+                "has to be interpreted."
+            )
+        else:
+            lines.append(
+                "The judging module recorded no trust flag for this premium, so the survival "
+                "rate above is the only guide to whether it rests on enough pairs."
             )
     if sample.median_length_ratio is not None:
         lines += [
@@ -1660,6 +1677,137 @@ def _judge_verdict(groups, curator: str, independent: str, arm: str) -> str:
         f"numbers do not need discounting on this account. The sample is {cases}, small enough "
         f"that a real effect of this size could still be missed."
     )
+
+
+def _author_effect_section(analysis: Analysis) -> list[str]:
+    """The same answers graded against an independently written standard."""
+    lines = ["", "## Author effect", ""]
+    lines.append(
+        "One model wrote every situation, every rubric and every anchor in this suite. The "
+        "judge-disagreement audit above cannot see that: both judges read the same rubric, so "
+        "the author's taste cancels out of their comparison by construction. Grading the same "
+        "answers against a standard written independently from the same specification is the "
+        "only thing in this run that can."
+    )
+    if not analysis.author_effect:
+        lines += [
+            "",
+            "**This control was not run"
+            + (
+                ", or produced nothing comparable."
+                if analysis.rival_cases
+                else "."
+            )
+            + "** Nothing here separates the arms' difference from the standard that measured "
+            "it. Read the absence as a missing control, not as evidence that the standard was "
+            "neutral.",
+        ]
+        lines += _divergence_note(analysis)
+        return lines
+
+    sample = analysis.author_effect[0]
+    lines += [
+        "",
+        f"Restricted to the {_plural(sample.cases, 'case')} carrying all four scores: each arm "
+        f"under each standard. The gap is `{sample.arm}` minus `{sample.baseline_arm}`.",
+        "",
+        "| group | gap under the original | gap under the rival | difference | narrower under "
+        "rival | wider | level | cases | families | sign test |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for effect in analysis.author_effect:
+        lines.append(
+            f"| {effect.group} | {_signed(effect.gap_original)} | {_signed(effect.gap_rival)} "
+            f"| **{_signed(effect.shrinkage)}** | {effect.narrower_under_rival} "
+            f"| {effect.wider_under_rival} | {effect.level} "
+            f"| {effect.cases}{' (small)' if effect.small_sample else ''} | {effect.families} "
+            f"| {_p(effect.p_value)} |"
+        )
+
+    detail = "; ".join(
+        f"{_signed(effect.shrinkage)} on {effect.group}" for effect in analysis.author_effect
+    )
+    material = [effect for effect in analysis.author_effect if effect.material]
+    lines += [
+        "",
+        f"**When someone else writes the standard, the gap changes by {detail}** on the 0-2 "
+        f"scale.",
+        "",
+    ]
+    if material:
+        groups = ", ".join(effect.group for effect in material)
+        lines.append(
+            f"That clears the {MATERIAL_AUTHOR_EFFECT:.2f} bar this report calls material. Part "
+            f"of the {groups} result was the standard rather than the model, and the headline "
+            f"for {groups} needs restating at the smaller figure. A gap that survives an "
+            f"independently written rubric is the part that belongs to the arm."
+        )
+    else:
+        lines.append(
+            f"That is below the {MATERIAL_AUTHOR_EFFECT:.2f} bar this report calls material, so "
+            f"the arms' difference is about the same size under a standard this suite's author "
+            f"did not write. On this evidence the result is not an artefact of who wrote the "
+            f"rubric."
+        )
+    lines += _divergence_note(analysis)
+    lines += [
+        "",
+        "Two limits on what this section covers.",
+        "",
+        "- Only the per-answer rubric scores are rivalled. The change expectations stay pinned "
+        "to the original suite, so every variant behaviour rate above is outside this audit and "
+        "carries the author's judgment untested.",
+        f"- The rivalled subset is a stratified fraction of families, "
+        f"{_plural(analysis.rival_families, 'family', 'families')} here against "
+        f"{analysis.suite_families} in the suite, so its sample is smaller than every other "
+        f"table in this report and the marked rates should be read accordingly.",
+    ]
+    return lines
+
+
+def _divergence_note(analysis: Analysis) -> list[str]:
+    """How far the rival standard actually fell from the original, which bounds the signal."""
+    divergence = analysis.rubric_divergence
+    if divergence is None:
+        if analysis.rival_cases:
+            return [
+                "",
+                "No divergence summary was supplied with the rival standard, so there is nothing "
+                "to say how far it fell from the original. A rival that happened to write nearly "
+                "the same rubric would produce a small difference above for a reason that has "
+                "nothing to do with the authoring being clean.",
+            ]
+        return []
+    lines = [
+        "",
+        f"How far the rival standard fell from the original, over "
+        f"{_plural(divergence.cases, 'rubric')}: median **{_num(divergence.median)}**, range "
+        f"{_num(divergence.minimum)} to {_num(divergence.maximum)}.",
+    ]
+    if divergence.degenerate:
+        lines += [
+            "",
+            "**The two standards are barely distinguishable, so this is a failed measurement "
+            "rather than a clean result.** A small difference between the two estimates means "
+            "only that the rival model agreed with the original author. It cannot show that the "
+            "standard was doing no work, because there was effectively only one standard.",
+        ]
+    elif divergence.identical or divergence.below_threshold:
+        parts = []
+        if divergence.identical:
+            parts.append(f"{_plural(divergence.identical, 'rubric')} came back word for word")
+        if divergence.below_threshold and divergence.threshold is not None:
+            parts.append(
+                f"{divergence.below_threshold} fell below the {divergence.threshold:.2f} floor"
+            )
+        lines += [
+            "",
+            "Of those, "
+            + " and ".join(parts)
+            + ". For those cases the comparison carries little signal, because the rival was "
+            "not saying anything different.",
+        ]
+    return lines
 
 
 # ------------------------------------------------------------------------------- bias audits
@@ -1961,6 +2109,7 @@ def render_report(analysis: Analysis, suite: Suite, meta: Mapping[str, Any] | No
     lines += _reliability(analysis)
     lines += _format_premium_section(analysis)
     lines += _judge_disagreement(analysis)
+    lines += _author_effect_section(analysis)
     lines += _bias(analysis)
     lines += _sample_counts(analysis, suite)
     lines += _capability(analysis)
@@ -1987,6 +2136,7 @@ REQUIRED_SECTIONS: tuple[str, ...] = (
     "## Grading reliability and unresolved counts",
     "## Format premium",
     "## Judge disagreement",
+    "## Author effect",
     "## Judge bias audits",
     "## Sample counts by scenario family",
     "## Capability results",

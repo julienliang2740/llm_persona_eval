@@ -1944,3 +1944,232 @@ def test_the_two_noise_floors_are_reasoned_in_the_rendered_text(basic_suite: Sui
     assert "one minus the consistency rate" in text
     assert "by changing its answer at random, having demonstrated nothing" in text
     assert "only evidence if the arm stays put when they do not" in text
+
+
+# ----------------------------------------------------------------------- the author effect
+
+
+def _rival(result: CaseResult) -> CaseResult:
+    """The same case and arm, graded against the rival standard."""
+    import copy
+
+    row = copy.deepcopy(result)
+    row.standard = "rival"
+    row.rubric_version = "rival-version"
+    return row
+
+
+def test_rival_scores_never_enter_a_dimension_mean(basic_suite: Suite) -> None:
+    """The whole point of the label: two standards must not pool into one number."""
+    case = basic_suite.case("fam_work.decide.original")
+    original = make_result(case, "base", {"reasoning_fidelity": 2})
+    rival = make_result(case, "base", {"reasoning_fidelity": 0})
+    rival.standard = "rival"
+    analysis = analyse(basic_suite, [original, rival])
+    stat = analysis.stat("base", "reasoning_fidelity")
+    assert stat is not None
+    assert stat.n == 1
+    assert stat.mean == pytest.approx(2.0)  # not 1.0
+    assert analysis.rival_cases == 1
+    assert any("never enter a per-dimension mean" in note for note in analysis.notes)
+
+
+def test_a_third_standard_is_a_defect_not_a_population(basic_suite: Suite) -> None:
+    case = basic_suite.case("fam_work.decide.original")
+    stray = make_result(case, "base", {"reasoning_fidelity": 0})
+    stray.standard = "something_else"
+    analysis = analyse(basic_suite, [make_result(case, "base", {"reasoning_fidelity": 2}), stray])
+    stat = analysis.stat("base", "reasoning_fidelity")
+    assert stat is not None and stat.n == 1
+    assert any("a third standard is a defect" in note for note in analysis.notes)
+
+
+def _author_effect_run(gap_original: int, gap_rival: int, suite: Suite):
+    """Build a four-cell run: each arm under each standard, over three cases."""
+    cases = [
+        suite.case("fam_work.decide.original"),
+        suite.case("fam_work.decide.pressure"),
+        suite.case("fam_far.decide.original"),
+    ]
+    results = []
+    for case in cases:
+        base = make_result(case, "base", {"reasoning_fidelity": 0})
+        arm = make_result(case, "adapter", {"reasoning_fidelity": gap_original})
+        base_rival = _rival(make_result(case, "base", {"reasoning_fidelity": 0}))
+        arm_rival = _rival(make_result(case, "adapter", {"reasoning_fidelity": gap_rival}))
+        results += [base, arm, base_rival, arm_rival]
+    return results
+
+
+def test_a_gap_that_shrinks_under_a_rival_standard_is_the_author_effect(basic_suite: Suite) -> None:
+    results = _author_effect_run(gap_original=2, gap_rival=0, suite=basic_suite)
+    report = {
+        "divergence_summary": {
+            "cases": 3,
+            "min": 0.5,
+            "median": 0.62,
+            "max": 0.8,
+            "mean": 0.64,
+            "identical": 0,
+            "below_low_divergence": 0,
+            "low_divergence_threshold": 0.35,
+        }
+    }
+    analysis = analyse(basic_suite, results, baseline_arm="base", rival_report=report)
+    effect = next(e for e in analysis.author_effect if e.group == "reasoning")
+    assert effect.gap_original == pytest.approx(2.0)
+    assert effect.gap_rival == pytest.approx(0.0)
+    assert effect.shrinkage == pytest.approx(2.0)
+    assert effect.narrower_under_rival == 3 and effect.wider_under_rival == 0
+    assert effect.material is True
+    assert analysis.rubric_divergence is not None
+    assert analysis.rubric_divergence.degenerate is False
+
+    text = render_report(analysis, basic_suite, {})
+    assert "## Author effect" in text
+    assert "clears the 0.15 bar" in text
+    assert "needs restating at the smaller figure" in text
+    assert "median **0.62**" in text
+    # Both limits must be stated rather than left to the reader.
+    assert "change expectations stay pinned" in text
+    assert "outside this audit" in text
+    assert "stratified fraction of families" in text
+
+
+def test_a_gap_that_survives_the_rival_standard_is_stated_as_such(basic_suite: Suite) -> None:
+    results = _author_effect_run(gap_original=2, gap_rival=2, suite=basic_suite)
+    analysis = analyse(basic_suite, results, baseline_arm="base")
+    effect = next(e for e in analysis.author_effect if e.group == "reasoning")
+    assert effect.shrinkage == pytest.approx(0.0)
+    assert effect.material is False
+    text = render_report(analysis, basic_suite, {})
+    # Same sentence shape either way, so its presence cannot leak the result.
+    assert "**When someone else writes the standard, the gap changes by " in text
+    assert "not an artefact of who wrote the rubric" in text
+
+
+def test_an_identical_rival_rubric_is_a_failed_measurement(basic_suite: Suite) -> None:
+    """A rival that agreed word for word cannot show the standard was doing no work."""
+    results = _author_effect_run(gap_original=2, gap_rival=2, suite=basic_suite)
+    report = {
+        "divergence_summary": {
+            "cases": 3,
+            "min": 0.0,
+            "median": 0.0,
+            "max": 0.0,
+            "identical": 3,
+            "below_low_divergence": 3,
+            "low_divergence_threshold": 0.35,
+        }
+    }
+    analysis = analyse(basic_suite, results, baseline_arm="base", rival_report=report)
+    assert analysis.rubric_divergence.degenerate is True
+    text = render_report(analysis, basic_suite, {})
+    assert "failed measurement rather than a clean result" in text
+    assert "there was effectively only one standard" in text
+    assert any("measures nothing" in note for note in analysis.notes)
+
+
+def test_a_missing_author_effect_reads_as_a_control_not_run(basic_suite: Suite) -> None:
+    case = basic_suite.case("fam_work.decide.original")
+    analysis = analyse(basic_suite, [make_result(case, "base", {"reasoning_fidelity": 2})])
+    assert analysis.author_effect == ()
+    text = render_report(analysis, basic_suite, {})
+    assert "## Author effect" in text
+    assert "**This control was not run.**" in text
+    assert "not as evidence that the standard was neutral" in text
+
+
+def test_rival_results_may_arrive_in_their_own_list(basic_suite: Suite) -> None:
+    """The rival command writes separate files, so they arrive as a separate population."""
+    cases = [
+        basic_suite.case("fam_work.decide.original"),
+        basic_suite.case("fam_work.decide.pressure"),
+    ]
+    main = []
+    rival = []
+    for case in cases:
+        main.append(make_result(case, "base", {"reasoning_fidelity": 0}))
+        main.append(make_result(case, "adapter", {"reasoning_fidelity": 2}))
+        rival.append(_rival(make_result(case, "base", {"reasoning_fidelity": 0})))
+        rival.append(_rival(make_result(case, "adapter", {"reasoning_fidelity": 1})))
+    analysis = analyse(basic_suite, main, baseline_arm="base", rival_results=rival)
+    effect = next(e for e in analysis.author_effect if e.group == "reasoning")
+    assert effect.gap_original == pytest.approx(2.0)
+    assert effect.gap_rival == pytest.approx(1.0)
+    assert effect.shrinkage == pytest.approx(1.0)
+    # And the rival scores stayed out of the main table.
+    stat = analysis.stat("adapter", "reasoning_fidelity")
+    assert stat is not None and stat.mean == pytest.approx(2.0)
+
+
+def test_a_phantom_arm_from_a_globbed_rival_file_is_flagged(basic_suite: Suite) -> None:
+    """A loader that globs results_*.jsonl over a rival file invents an arm; say so."""
+    case = basic_suite.case("fam_work.decide.original")
+    results = [
+        make_result(case, "base", {"reasoning_fidelity": 2}),
+        make_result(case, "rival_base", {"reasoning_fidelity": 0}),
+    ]
+    analysis = analyse(basic_suite, results, baseline_arm="base")
+    assert any("look like another arm" in note for note in analysis.notes)
+    text = render_report(analysis, basic_suite, {})
+    assert "Check that these are real arms" in text
+
+
+def test_the_premium_trust_flag_is_stated_in_all_three_states(basic_suite: Suite) -> None:
+    """Silence about trust would have to be interpreted, so it is never left silent."""
+    case = basic_suite.case("fam_work.decide.original")
+    wanted = {
+        True: "marks this premium trustworthy",
+        False: "marks this premium untrustworthy",
+        None: "recorded no trust flag",
+    }
+    for flag, phrase in wanted.items():
+        results = [make_result(case, "base", {"reasoning_fidelity": 1})]
+        row = make_result(case, "base_recast", {"reasoning_fidelity": 2})
+        row.answer_meta = {"form_control_of": "base"}
+        premium = _FormPremiumLike(
+            [row], n_attempted=10, n_usable=1, rejected={}, trustworthy=flag
+        )
+        analysis = analyse(basic_suite, results, baseline_arm="base", form_control=premium)
+        text = render_report(analysis, basic_suite, {})
+        assert phrase in text, flag
+
+
+def test_the_quoted_premium_sentence_names_its_baseline(basic_suite: Suite) -> None:
+    case = basic_suite.case("fam_work.decide.original")
+    results = [make_result(case, "base", {"reasoning_fidelity": 0})]
+    in_batch = make_result(case, "base_recast", {"reasoning_fidelity": 2})
+    in_batch.answer_meta = {
+        "form_control_of": "base",
+        "form_control_baseline_scores": {"reasoning_fidelity": 1},
+    }
+    text = render_report(
+        analyse(basic_suite, results, baseline_arm="base", form_control=[in_batch]),
+        basic_suite,
+        {},
+    )
+    sentence = text.split("**The shape alone is worth ")[1].split("\n")[0]
+    assert "only the form differs" in sentence
+
+    drifted = make_result(case, "base_recast", {"reasoning_fidelity": 2})
+    drifted.answer_meta = {"form_control_of": "base"}
+    text = render_report(
+        analyse(basic_suite, results, baseline_arm="base", form_control=[drifted]),
+        basic_suite,
+        {},
+    )
+    sentence = text.split("**The shape alone is worth ")[1].split("\n")[0]
+    assert "grading drift may be folded in" in sentence
+
+
+def test_recast_rows_are_not_treated_as_an_arm(basic_suite: Suite) -> None:
+    case = basic_suite.case("fam_work.decide.original")
+    results = [make_result(case, "base", {"reasoning_fidelity": 1})]
+    row = make_result(case, "base_recast", {"reasoning_fidelity": 2})
+    row.answer_meta = {"form_control_of": "base"}
+    analysis = analyse(basic_suite, results, baseline_arm="base", form_control=[row])
+    assert analysis.arms == ("base",)
+    assert analysis.stat("base_recast", "reasoning_fidelity") is None
+    text = render_report(analysis, basic_suite, {})
+    assert "| `base_recast` |" not in text.split("## Format premium")[0]
