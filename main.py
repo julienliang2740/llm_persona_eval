@@ -473,6 +473,11 @@ async def cmd_rival(args: argparse.Namespace) -> int:
         results = await judge_cases(
             config, spec, rivalled, answers, judge_role_name=args.judge_role, usage_path=usage_path
         )
+        # Stamp the standard these scores were produced against. Without it the report cannot
+        # tell a rival-graded score from an original-graded one, and the two would pool into
+        # a single mean, averaging away the very comparison this command exists to make.
+        for result in results:
+            result.standard = "rival"
         runs.write_jsonl(directory / f"results_rival_{arm}.jsonl", results)
         per_arm[arm] = len(results)
 

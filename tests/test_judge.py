@@ -2079,3 +2079,115 @@ def test_the_field_round_trips_and_the_property_still_reads_a_legacy_only_result
     assert legacy.judging == {}
     assert legacy.judging_record["dimensions_failed"] == 2
     assert judging_record(legacy)["dimensions_failed"] == 2
+
+
+# ------------------------------------ form-control rows in the shape the report consumes
+
+
+def test_the_recasts_are_published_as_case_results_for_the_report(tmp_path):
+    suite = a_suite(cases=tuple(a_case(f"c_{i}") for i in range(4)))
+    results = [graded(f"c_{i}", arm="base", scores=(1, 1, 1)) for i in range(4)]
+    premium = asyncio.run(
+        measure_form_premium(a_config(tmp_path), "SPEC", suite, results, n=4,
+                             client=FormClient(recast_scores=(2, 2, 2), original_scores=(1, 1, 1)))
+    )
+    rows = premium.recast_rows
+    assert len(rows) == 4
+    for row in rows:
+        assert isinstance(row, CaseResult)
+        # Pairing is on case_id, so the recast keeps the case it answers.
+        assert row.case_id.startswith("c_")
+        # ...but a new arm label, so it is never mistaken for a real answer from the model.
+        assert row.arm == "base_recast"
+        assert row.answer_meta["form_control_of"] == "base"
+        assert [s.score for s in row.scores] == [2, 2, 2]
+        assert row.judge_pass == 0
+        assert row.rubric_version == a_rubric().version
+
+
+def test_the_recast_arm_label_can_be_set(tmp_path):
+    premium = asyncio.run(
+        measure_form_premium(a_config(tmp_path), "SPEC", a_suite(), [graded(arm="base")],
+                             recast_arm="scaffolded", client=FormClient())
+    )
+    assert premium.recast_rows[0].arm == "scaffolded"
+    assert premium.recast_rows[0].answer_meta["form_control_of"] == "base"
+
+
+def test_each_row_names_the_arm_it_was_actually_recast_from(tmp_path):
+    """Mixed input produces per-row truth rather than one guessed source label."""
+    suite = a_suite(cases=(a_case("c_a"), a_case("c_b")))
+    results = [graded("c_a", arm="base"), graded("c_b", arm="adapter")]
+    premium = asyncio.run(
+        measure_form_premium(a_config(tmp_path), "SPEC", suite, results, n=2, client=FormClient())
+    )
+    sources = {r.case_id: r.answer_meta["form_control_of"] for r in premium.recast_rows}
+    assert sources == {"c_a": "base", "c_b": "adapter"}
+    assert {r.arm for r in premium.recast_rows} == {"base_recast", "adapter_recast"}
+
+
+def test_a_rejected_recast_never_reaches_the_report(tmp_path):
+    """Otherwise the report's premium would include rewrites that changed substance."""
+    premium = asyncio.run(
+        measure_form_premium(a_config(tmp_path), "SPEC", a_suite(), [graded(arm="base")],
+                             client=FormClient(moved=True))
+    )
+    assert premium.pairs and premium.recast_rows == []
+
+
+def test_the_rows_carry_the_in_batch_baseline_so_the_report_can_match_this_module(tmp_path):
+    """The report otherwise pairs against the main run's score and gets a slightly different gap."""
+    premium = asyncio.run(
+        measure_form_premium(a_config(tmp_path), "SPEC", a_suite(), [graded(arm="base")],
+                             client=FormClient(recast_scores=(2, 2, 2), original_scores=(1, 1, 1)))
+    )
+    row = premium.recast_rows[0]
+    assert row.answer_meta["form_control_baseline_scores"] == {
+        "action_judgment": 1, "reasoning_fidelity": 1, "roles_relationships": 1
+    }
+    recast = {s.dimension: s.score for s in row.scores}
+    gap = [recast[d] - v for d, v in row.answer_meta["form_control_baseline_scores"].items()]
+    assert sum(gap) / len(gap) == premium.overall_gap
+
+
+def test_the_rows_round_trip_through_the_dicts_the_report_accepts(tmp_path):
+    premium = asyncio.run(
+        measure_form_premium(a_config(tmp_path), "SPEC", a_suite(), [graded(arm="base")],
+                             client=FormClient())
+    )
+    payload = premium.to_dict()
+    revived = [CaseResult.from_dict(r) for r in payload["recast_rows"]]
+    assert revived[0].arm == "base_recast"
+    assert revived[0].answer_meta["form_control_of"] == "base"
+    assert [s.score for s in revived[0].scores] == [2, 2, 2]
+    # The pair payload does not repeat the whole row.
+    assert "recast_result" not in payload["pairs"][0]
+
+
+def test_the_recast_row_answer_text_is_the_recast_not_the_original(tmp_path):
+    """The report's worst-example table must show what was actually graded."""
+    premium = asyncio.run(
+        measure_form_premium(a_config(tmp_path), "SPEC", a_suite(), [graded(arm="base")],
+                             client=FormClient(recast="A SCAFFOLDED VERSION OF THE ANSWER"))
+    )
+    assert premium.recast_rows[0].answer_text == "A SCAFFOLDED VERSION OF THE ANSWER"
+
+
+def test_the_literals_the_report_mirrors_still_match():
+    """report-analysis copies these three strings rather than importing them."""
+    from persona_eval.run.judge import JUDGING_FAILURE_PREFIX as prefix
+    from persona_eval.run.judge import NOTE_INAPPLICABLE as inapplicable
+    from persona_eval.run.judge import SELF_CONSISTENCY as floor
+
+    assert prefix == "judging_failure:"
+    assert inapplicable == "inapplicable:"
+    assert floor == "self_consistency"
+    # ...and they really are what lands on a result and a verdict.
+    payload = good_payload()
+    payload["scores"] = payload["scores"][:2]
+    payload["scores"][0] = {"dimension": "action_judgment", "applicable": False,
+                            "score": None, "quote": "", "note": "not observable"}
+    result = asyncio.run(judge_case(FakeClient([payload]), "SPEC", a_case(), ANSWER, "judge-a"))
+    notes = [s.note for s in result.scores if s.score is None]
+    assert any(n.startswith(inapplicable) for n in notes)
+    assert any(n.startswith(prefix) for n in notes)

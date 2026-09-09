@@ -1683,3 +1683,101 @@ def test_a_thin_regression_is_named_but_not_promoted(basic_suite: Suite) -> None
     # Every regressed slice here is thin, so the fallback wording must appear rather than a
     # confident headline.
     assert "is not quotable" not in text
+
+
+# ------------------------------------------------------- the fourth cause: planned and lost
+
+
+def _planned_suite(scorable: tuple[str, ...], cases, dropped_authoring=0, dropped_review=0) -> Suite:
+    """A suite carrying an authoring plan, as author.py attaches it to Suite.authoring."""
+    return Suite(
+        suite_id="planned",
+        target_id="confucian",
+        spec_version="v0",
+        spec_hash="abc123",
+        created_utc="2026-09-09T00:00:00Z",
+        families=(make_family("fam_p"),),
+        cases=tuple(cases),
+        authoring={
+            "plan": {"scorable_dimensions": list(scorable)},
+            "cases": {"dropped": [{"case_id": f"d{i}"} for i in range(dropped_authoring)]},
+            "rubric_review": {
+                "dropped_cases": [{"case_id": f"r{i}"} for i in range(dropped_review)]
+            },
+        },
+    )
+
+
+def test_a_dimension_the_plan_could_reach_but_the_suite_cannot_is_a_run_defect() -> None:
+    """The case the authoring team raised: every decide case dropped after planning.
+
+    A suite-derived ceiling alone reports action_judgment as unreachable, which reads as a
+    design limitation. The truth is that the suite was built to measure it and the cases were
+    destroyed, which is the most important line in the report.
+    """
+    notice_only = make_case(
+        "fam_p.notice.original", "fam_p", task="notice", dimensions=NOTICE_DIMENSIONS
+    )
+    suite = _planned_suite(
+        scorable=("salience", "relevance_boundaries", "uncertainty", "action_judgment", "prioritization"),
+        cases=[notice_only],
+        dropped_authoring=2,
+        dropped_review=3,
+    )
+    analysis = analyse(suite, [make_result(notice_only, "base", {"salience": 2})])
+    text = render_report(analysis, suite, {})
+    assert "**Planned and lost.**" in text
+    sentence = text.split("**Planned and lost.**")[1].split(".")[0]
+    assert "action_judgment" in sentence and "prioritization" in sentence
+    assert "a defect in the run, not a limit of the design" in text
+    assert "2 cases dropped during authoring and 3 cases dropped by the rubric review" in text
+    assert "| action_judgment | action | 0 | 0 | **planned and lost** |" in text
+    # And it must not be filed under the structural gap, which is the misattribution.
+    structural = text.split("**A structural gap.**")[1].split(".")[0] if "**A structural gap.**" in text else ""
+    assert "action_judgment" not in structural
+
+
+def test_a_dimension_unreachable_by_plan_and_suite_stays_a_structural_gap() -> None:
+    notice_only = make_case(
+        "fam_p.notice.original", "fam_p", task="notice", dimensions=NOTICE_DIMENSIONS
+    )
+    suite = _planned_suite(
+        scorable=("salience", "relevance_boundaries", "uncertainty"),
+        cases=[notice_only],
+    )
+    analysis = analyse(suite, [make_result(notice_only, "base", {"salience": 2})])
+    text = render_report(analysis, suite, {})
+    assert "**Planned and lost.**" not in text
+    assert "**A structural gap.**" in text
+    assert "| action_judgment | action | 0 | 0 | **unreachable** |" in text
+
+
+def test_a_hand_built_suite_with_no_plan_degrades_to_three_causes(basic_suite: Suite) -> None:
+    """No authoring plan means the split cannot be made, and nothing should be invented."""
+    assert basic_suite.authoring == {}
+    analysis = analyse(basic_suite, [make_result(basic_suite.case("fam_work.decide.original"), "base", {"action_judgment": 2})])
+    text = render_report(analysis, basic_suite, {})
+    assert "**Planned and lost.**" not in text
+    assert "**planned and lost**" not in text
+    assert "**A coverage gap.**" in text
+
+
+def test_a_malformed_plan_key_does_not_break_the_report() -> None:
+    notice_only = make_case(
+        "fam_p.notice.original", "fam_p", task="notice", dimensions=NOTICE_DIMENSIONS
+    )
+    for broken in ({"plan": "not a mapping"}, {"plan": {"scorable_dimensions": []}}, {"plan": {}}):
+        suite = Suite(
+            suite_id="s",
+            target_id="t",
+            spec_version="v",
+            spec_hash="h",
+            created_utc="2026-09-09T00:00:00Z",
+            families=(make_family("fam_p"),),
+            cases=(notice_only,),
+            authoring=broken,
+        )
+        analysis = analyse(suite, [make_result(notice_only, "base", {"salience": 2})])
+        text = render_report(analysis, suite, {})
+        assert "**Planned and lost.**" not in text
+        assert "### Dimension coverage" in text

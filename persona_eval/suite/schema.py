@@ -544,6 +544,13 @@ class CaseResult:
     judge_model: str = ""
     judge_pass: int = 0
     rubric_version: str = ""
+    # Which STANDARD this score was produced against. "original" is the suite's own rubric;
+    # "rival" is one written independently, from the same specification, by a model that never
+    # saw the original. The author-effect audit grades the same answers against both, so
+    # without this label the two would pool into one mean with no warning, and the comparison
+    # that exists to detect a contaminated standard would be silently averaged away by it.
+    # `rubric_version` cannot serve: it distinguishes the rubrics but does not say which is which.
+    standard: str = "original"
     answer_meta: dict[str, Any] = field(default_factory=dict)
     judge_rationale: str = ""
     # Facts about the GRADING rather than about the answer: how many dimensions were scored,

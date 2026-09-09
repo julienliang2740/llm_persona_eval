@@ -238,6 +238,38 @@ def _how_to_read(analysis: Analysis) -> list[str]:
 # -------------------------------------------------------------------------- diagnostic scores
 
 
+def _plan_reachable(suite: Suite) -> set[str] | None:
+    """Dimensions the authoring plan's coverage matrix could reach, if the suite records one.
+
+    Returns None for a hand-built suite with no plan, in which case the caller degrades to the
+    three-way split that the suite alone can support.
+    """
+    authoring = suite.authoring if isinstance(suite.authoring, Mapping) else {}
+    plan = authoring.get("plan")
+    if not isinstance(plan, Mapping):
+        return None
+    listed = plan.get("scorable_dimensions")
+    if not isinstance(listed, (list, tuple)) or not listed:
+        return None
+    return {str(dimension) for dimension in listed}
+
+
+def _drop_counts(suite: Suite) -> tuple[int, int]:
+    """(cases dropped while authoring, cases dropped by the rubric review)."""
+    authoring = suite.authoring if isinstance(suite.authoring, Mapping) else {}
+
+    def count(section: Any, key: str) -> int:
+        if not isinstance(section, Mapping):
+            return 0
+        rows = section.get(key)
+        return len(rows) if isinstance(rows, (list, tuple)) else 0
+
+    return (
+        count(authoring.get("cases"), "dropped"),
+        count(authoring.get("rubric_review"), "dropped_cases"),
+    )
+
+
 def _dimension_coverage(analysis: Analysis, suite: Suite) -> list[str]:
     """Why a dimension is missing or thin: the suite could not reach it, did not pick it, or
     picked it and got nothing back.
@@ -263,9 +295,24 @@ def _dimension_coverage(analysis: Analysis, suite: Suite) -> list[str]:
     }
     scored = {stat.dimension for stat in analysis.dimension_stats if stat.n}
 
+    # The suite-derived ceiling cannot tell a task that was never planned from one whose cases
+    # were all destroyed after planning, and it reports the second as the first. That is the
+    # damaging direction: a suite built to score action judgment whose decide cases were all
+    # dropped would print as a design limitation rather than as the run defect it is.
+    planned = _plan_reachable(suite)
+    unreachable_by_suite = [d for d in DIMENSIONS if not reachable[d]]
+    if planned is None:
+        planned_and_lost: list[str] = []
+        structural = unreachable_by_suite
+    else:
+        planned_and_lost = [d for d in unreachable_by_suite if d in planned]
+        structural = [d for d in unreachable_by_suite if d not in planned]
+
     def status(dimension: str) -> str:
         if dimension in scored:
             return "scored"
+        if dimension in planned_and_lost:
+            return "**planned and lost**"
         if not reachable[dimension]:
             return "**unreachable**"
         if not selected[dimension]:
@@ -276,8 +323,9 @@ def _dimension_coverage(analysis: Analysis, suite: Suite) -> list[str]:
         "",
         "### Dimension coverage",
         "",
-        "A dimension missing from the tables above has three possible causes, and they mean "
-        "different things. This is which one applies.",
+        "A dimension missing from the tables above has several possible causes, and they mean "
+        "very different things. One of them is a defect in this run rather than a limit of the "
+        "suite. This is which one applies.",
         "",
         "| dimension | group | cases whose task allows it | cases whose rubric scores it | status |",
         "|---|---|---|---|---|",
@@ -293,19 +341,40 @@ def _dimension_coverage(analysis: Analysis, suite: Suite) -> list[str]:
         """Verb and pronoun for a list that is often one item and often several."""
         return ("is", "it") if len(names) == 1 else ("are", "them")
 
-    unreachable = [d for d in DIMENSIONS if not reachable[d]]
+    unreachable = structural
     never_chosen = [d for d in DIMENSIONS if reachable[d] and not selected[d]]
     not_returned = [d for d in DIMENSIONS if selected[d] and d not in scored]
     lines.append("")
+    if planned_and_lost:
+        verb, _pronoun = agree(planned_and_lost)
+        authored, reviewed = _drop_counts(suite)
+        lines.append(
+            "**Planned and lost.** "
+            + ", ".join(planned_and_lost)
+            + f" {verb} reachable by the plan this suite was built from, and no surviving case "
+            f"can score {'it' if len(planned_and_lost) == 1 else 'them'}. The suite was built to "
+            f"measure this and the cases that would have measured it are gone. That is a defect "
+            f"in the run, not a limit of the design."
+        )
+        if authored or reviewed:
+            lines.append("")
+            lines.append(
+                f"The drop records say what happened: {_plural(authored, 'case')} dropped during "
+                f"authoring and {_plural(reviewed, 'case')} dropped by the rubric review. They "
+                f"carry the reasons, and they are the place to start."
+            )
     if unreachable:
+        lines.append("")
+        _verb, pronoun = agree(unreachable)
         lines.append(
             "**A structural gap.** No task in this suite permits "
             + ", ".join(unreachable)
-            + ", so no answer could have been scored on it however the model replied. That is a "
-            "gap in what the suite can see, not a clean record for any arm."
+            + f", so no answer could have been scored on {pronoun} however the model replied. "
+            "That is a gap in what the suite can see, not a clean record for any arm."
         )
     if never_chosen:
         _verb, pronoun = agree(never_chosen)
+        lines.append("")
         lines.append(
             "**A coverage gap.** "
             + ", ".join(never_chosen)
@@ -317,6 +386,7 @@ def _dimension_coverage(analysis: Analysis, suite: Suite) -> list[str]:
         )
     if not_returned:
         verb, pronoun = agree(not_returned)
+        lines.append("")
         lines.append(
             "**A defect in the run.** "
             + ", ".join(not_returned)
@@ -329,6 +399,7 @@ def _dimension_coverage(analysis: Analysis, suite: Suite) -> list[str]:
     thin = [d for d in DIMENSIONS if 0 < reachable[d] < MIN_CELL_N]
     if thin:
         verb, _pronoun = agree(thin)
+        lines.append("")
         lines.append(
             "**Cannot reach an interpretable sample.** "
             + ", ".join(f"{d} ({_plural(reachable[d], 'case')})" for d in thin)

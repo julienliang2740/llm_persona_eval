@@ -88,6 +88,9 @@ class FormPair:
     rewriter_model: str = ""
     judge_model: str = ""
     sections_left_empty: list[str] = field(default_factory=list)
+    # The graded recast, kept as a CaseResult so the report can consume it through the same
+    # path as every other graded answer. Only attached when the pair survived the gate.
+    recast_result: CaseResult | None = None
 
     @property
     def usable(self) -> bool:
@@ -110,6 +113,9 @@ class FormPair:
         payload = asdict(self)
         payload["length_ratio"] = self.length_ratio
         payload["usable"] = self.usable
+        # The full row is published separately on FormPremium; repeating it inside every
+        # pair would double the answer text in the analysis file for no reader.
+        payload.pop("recast_result", None)
         return payload
 
 
@@ -127,6 +133,11 @@ class FormPremium:
     rewriter_model: str = ""
     judge_model: str = ""
     median_length_ratio: float | None = None
+    # The graded recasts, as CaseResults, for `analyse(..., form_control=rows)`. ONLY the
+    # pairs that survived the gate: a recast that moved the position must not reach the
+    # report, or its premium would be computed over rewrites that changed substance and
+    # would silently disagree with `overall_gap` here.
+    recast_rows: list[CaseResult] = field(default_factory=list)
 
     @property
     def trustworthy(self) -> bool:
@@ -140,6 +151,7 @@ class FormPremium:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["pairs"] = [p.to_dict() for p in self.pairs]
+        payload["recast_rows"] = [r.to_dict() for r in self.recast_rows]
         payload["trustworthy"] = self.trustworthy
         return payload
 
@@ -249,11 +261,22 @@ async def measure_form_premium(
     usage_path: Path | None = None,
     seed: int = 0,
     rejudge_original: bool = True,
+    recast_arm: str | None = None,
     client: ModelClient | None = None,
 ) -> FormPremium:
     """How many points is the scaffold worth on its own, with substance held constant?
 
     Runs after grading, so it is never on the generation critical path.
+
+    `FormPremium.recast_rows` carries the graded recasts as CaseResults, which is what the
+    report consumes: `analyse(..., form_control=premium.recast_rows)`. Each row keeps the
+    source `case_id` so pairing works, takes `recast_arm` (default `<source>_recast`) as its
+    arm so it can never be mistaken for an answer the model under test produced, and names
+    the arm it came from in `answer_meta["form_control_of"]`.
+
+    Only pairs that survived the gate are published. A recast that moved the position is
+    excluded here as it is from `overall_gap`, so the report cannot compute a premium over
+    rewrites that changed substance and then disagree with the number in this object.
 
     `rejudge_original` re-grades the untouched answer in the same batch as its recast,
     rather than reusing the score from the main run. It costs one extra call per pair and
@@ -339,6 +362,21 @@ async def measure_form_premium(
             return pair
         pair.recast_scores = _scores_of(graded)
 
+        # Label the row for the report. case_id is untouched, because pairing is on case_id
+        # and the recast answers the same case. The arm is a NEW label so the recast can
+        # never be mistaken for an answer the model under test actually produced, and
+        # form_control_of names the arm it was recast from - taken from the source result
+        # itself, so mixed input produces per-row truth rather than one guessed label.
+        graded.arm = recast_arm or f"{result.arm or 'source'}_recast"
+        graded.model_id = rewriter.model
+        graded.answer_meta = {
+            **(graded.answer_meta or {}),
+            "form_control_of": result.arm,
+            "form_control": True,
+            "words_original": pair.words_original,
+            "words_recast": pair.words_recast,
+        }
+
         if rejudge_original:
             baseline = await judge_case(
                 client_, spec_text, case, result.answer_text, judge,
@@ -348,8 +386,13 @@ async def measure_form_premium(
                 pair.rejected = "the original could not be re-graded alongside its recast"
                 return pair
             pair.original_scores = _scores_of(baseline)
+            # The in-batch re-grade of the untouched answer. Published on the row so a
+            # report that wants the drift-free pairing can use it instead of the score the
+            # main run recorded, and get the same number this module computes.
+            graded.answer_meta["form_control_baseline_scores"] = dict(pair.original_scores)
         else:
             pair.original_scores = _scores_of(result)
+        pair.recast_result = graded
         return pair
 
     try:
@@ -414,6 +457,7 @@ def summarise(
     all_deltas = [float(b - a) for values in by_dimension.values() for a, b in values]
     ratios = sorted(p.length_ratio for p in usable if p.length_ratio is not None)
     return FormPremium(
+        recast_rows=[p.recast_result for p in usable if p.recast_result is not None],
         pairs=list(pairs),
         by_dimension=dimensions,
         by_group=groups,
