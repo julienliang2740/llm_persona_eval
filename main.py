@@ -247,7 +247,10 @@ async def cmd_judge(args: argparse.Namespace) -> int:
     runs.write_jsonl(runs.results_path(directory, args.arm), results)
 
     verdicts = await judge_changes(
-        config, spec, suite, answers, judge_role_name=args.judge_role, usage_path=directory / runs.USAGE_FILE
+        config, spec, suite, answers,
+        judge_role_name=args.judge_role,
+        usage_path=directory / runs.USAGE_FILE,
+        **_change_kwargs(args),
     )
     runs.write_jsonl(runs.changes_path(directory, args.arm), verdicts)
     runs.record_stage(
@@ -273,6 +276,28 @@ async def cmd_capability(args: argparse.Namespace) -> int:
     runs.record_stage(directory, f"capability_{args.arm}", summary)
     print(json.dumps(summary, indent=2))
     return 0
+
+
+def _change_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """Optional judge_changes controls, passed only when the installed signature accepts them.
+
+    The repeat pass is opt-in and separate from `--repeat-fraction`, which governs dimension
+    scores. They are deliberately not the same knob: repeat change verdicts are only safe to
+    request once the analysis splits verdicts on judge_pass, and until then a repeat would
+    inflate every behaviour rate rather than measure its stability.
+    """
+    import inspect
+
+    wanted = {
+        "repeat_fraction": getattr(args, "change_repeat_fraction", 0.0) or 0.0,
+        "self_consistency_fraction": getattr(args, "self_consistency", 0.0) or 0.0,
+    }
+    accepted = set(inspect.signature(judge_changes).parameters)
+    passed = {k: v for k, v in wanted.items() if k in accepted and v}
+    for key, value in wanted.items():
+        if value and key not in accepted:
+            logger.warning("judge_changes does not accept %s=%s in this build; ignored", key, value)
+    return passed
 
 
 def _load_results(directory: Path, arm: str) -> list[CaseResult]:
@@ -314,6 +339,15 @@ def cmd_report(args: argparse.Namespace) -> int:
         if name.startswith("answer_") and stage.get("settings")
     ]
     matched, mismatches = runs.settings_match(signatures)
+    # The record says what the run intended; the answers say what it did. `settings_disagreement`
+    # reads the fingerprint stamped on each answer, so it catches a run whose record and
+    # behaviour parted company. Both are reported; either one failing invalidates a comparison.
+    observed: list[str] = []
+    for arm in arms:
+        observed += [f"{arm}: {problem}" for problem in settings_disagreement(runs.read_jsonl(runs.answers_path(directory, arm)))]
+    if observed:
+        matched = False
+        mismatches = mismatches + observed
     meta = {
         "run_id": args.run,
         "run_dir": str(directory),
@@ -399,7 +433,10 @@ async def cmd_run(args: argparse.Namespace) -> int:
         )
         runs.write_jsonl(runs.results_path(directory, label), results)
         verdicts = await judge_changes(
-            config, spec, suite, answers, judge_role_name=args.judge_role, usage_path=usage_path
+            config, spec, suite, answers,
+            judge_role_name=args.judge_role,
+            usage_path=usage_path,
+            **_change_kwargs(args),
         )
         runs.write_jsonl(runs.changes_path(directory, label), verdicts)
         runs.record_stage(directory, f"judge_{label}", {"results": len(results), "verdicts": len(verdicts)})
@@ -477,6 +514,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--second-judge-role", default=None)
     p.add_argument("--second-judge-fraction", type=float, default=1.0)
     p.add_argument("--repeat-fraction", type=float, default=0.0)
+    p.add_argument("--change-repeat-fraction", type=float, default=0.0, help="re-judge a sample of change verdicts to measure their stability")
+    p.add_argument("--self-consistency", type=float, default=0.0, help="answer this fraction of originals twice to establish a noise floor")
 
     p = common(sub.add_parser("capability", help="run the general-capability checks for one arm"))
     p.add_argument("--run", required=True)
@@ -498,6 +537,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--second-judge-role", default=None)
     p.add_argument("--second-judge-fraction", type=float, default=1.0)
     p.add_argument("--repeat-fraction", type=float, default=0.0)
+    p.add_argument("--change-repeat-fraction", type=float, default=0.0, help="re-judge a sample of change verdicts to measure their stability")
+    p.add_argument("--self-consistency", type=float, default=0.0, help="answer this fraction of originals twice to establish a noise floor")
     p.add_argument("--curator-judge", default=None)
     p.add_argument("--skip-capability", action="store_true")
 

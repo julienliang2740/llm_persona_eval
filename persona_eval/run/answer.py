@@ -31,6 +31,7 @@ handed back in via `prior_answers` so a resumed run does not pay for them twice.
 from __future__ import annotations
 
 import logging
+import random
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -276,6 +277,49 @@ def dependency_levels(cases: Sequence[Case], already_answered: Iterable[str] = (
 # ------------------------------------------------------------------------ the main call
 
 
+def self_consistency_cases(
+    suite: Suite,
+    cases: Sequence[Case],
+    count: int | float | None,
+    seed: int = 0,
+) -> list[Case]:
+    """Which original cases to answer a second time, to measure the noise floor.
+
+    Every case is answered once at a non-zero temperature, and paraphrase and
+    irrelevant-change cases are fresh contexts. So an invariance comparison is two
+    independent draws from a stochastic model, and an invariance rate means nothing until
+    you know how often the position moves when NOTHING changed. Answering a subset of the
+    originals twice gives that floor per arm, and every other family-level rate is then
+    read as a difference from it rather than as an absolute.
+
+    Only single-turn originals are eligible. A continuation's repeat would need its
+    parent's repeat too, which measures the chain rather than the case.
+
+    The sample is seeded on the suite alone and NOT on the arm, so both arms probe the same
+    cases: a noise floor measured on different material is not a floor either of them can
+    be compared against.
+    """
+    eligible = sorted(
+        (
+            c
+            for c in cases
+            if c.variant == "original" and not c.context_answer_from and len(c.turns) == 1
+        ),
+        key=lambda c: c.case_id,
+    )
+    if not eligible or not count:
+        return []
+    if isinstance(count, float) and 0.0 < count < 1.0:
+        wanted = int(round(count * len(eligible)))
+    else:
+        wanted = int(count)
+    wanted = max(0, min(wanted, len(eligible)))
+    if not wanted:
+        return []
+    rng = random.Random(f"{suite.version}:{seed}:self_consistency")
+    return sorted(rng.sample(eligible, wanted), key=lambda c: c.case_id)
+
+
 def _answer_record(
     case: Case,
     arm: str,
@@ -288,6 +332,7 @@ def _answer_record(
     messages: list[dict[str, str]] | None = None,
     response: Any = None,
     error: str = "",
+    repeat_index: int = 0,
 ) -> dict[str, Any]:
     usage = getattr(response, "usage", None) or {}
     finish_reason = str(getattr(response, "finish_reason", "") or "")
@@ -311,8 +356,15 @@ def _answer_record(
         "n_turns_sent": len(messages or []),
         "requested": requested,
         "error": error,
+        # 0 is the answer of record. Anything above 0 is a self-consistency probe: a second
+        # independent draw on the identical prompt, used only to measure the noise floor.
+        "repeat_index": repeat_index,
     }
     return {
+        # answer_id, not case_id, is what uniquely identifies a row. A probe repeat shares
+        # its case_id with the answer of record - it IS the same case - so anything that
+        # keys on case_id alone would silently overwrite one with the other.
+        "answer_id": case.case_id if not repeat_index else f"{case.case_id}#r{repeat_index}",
         "case_id": case.case_id,
         "family_id": case.family_id,
         "task": case.task,
@@ -336,6 +388,8 @@ async def answer_cases(
     settings: GenerationSettings | None = None,
     prior_answers: Sequence[dict[str, Any]] | None = None,
     client: ModelClient | None = None,
+    self_consistency: int | float | None = None,
+    self_consistency_seed: int = 0,
 ) -> list[dict[str, Any]]:
     """Answer `cases` with one model role, resolving continuation dependencies first.
 
@@ -346,7 +400,13 @@ async def answer_cases(
     `limit` caps the requested cases; dependencies of the surviving cases are still pulled
     in, because a pressure case answered without its original is not a pressure test.
 
-    Returns one record per case answered, including dependency-only cases, which carry
+    `self_consistency` answers that many original cases a SECOND time (an int for a count,
+    a fraction between 0 and 1 for a share) so the run carries its own noise floor. The
+    repeat rows have the same `case_id`, a distinct `answer_id`, and `meta.repeat_index`
+    above 0. Defaults to None, which answers nothing extra and leaves existing callers
+    unchanged.
+
+    Returns one record per answer produced, including dependency-only cases, which carry
     `meta.requested = False` so a caller can drop them from the headline counts.
     """
     role = config.role(endpoint_role)
@@ -377,74 +437,116 @@ async def answer_cases(
     records: list[dict[str, Any]] = []
     owns_client = client is None
     client = client or ModelClient.from_config(config, usage_path, STAGE)
+
+    async def answer_one(
+        case: Case,
+        use_settings: GenerationSettings,
+        use_role: ModelRole,
+        repeat_index: int = 0,
+    ) -> dict[str, Any]:
+        isolation = isolation_of(suite, case)
+        requested = case.case_id in requested_ids
+        record_id = case.case_id if not repeat_index else f"{case.case_id}#r{repeat_index}"
+        try:
+            messages = build_messages(suite, case, answer_text_by_case, use_settings)
+        except ValueError as error:
+            # An upstream answer is missing, usually because the original case itself
+            # failed. Never fabricate the missing turn: record the reason and let the
+            # report show the continuation as unrun.
+            logger.error("%s: %s", case.case_id, error)
+            return _answer_record(
+                case, arm, use_role.model, "", use_settings, endpoint_role,
+                isolation, requested, error=str(error), repeat_index=repeat_index,
+            )
+        started = time.monotonic()
+        try:
+            response = await client.complete(
+                use_role,
+                messages,
+                temperature=use_settings.temperature,
+                max_tokens=use_settings.max_tokens,
+                stage=f"{STAGE}.{arm}",
+                record_id=record_id,
+            )
+        except LocalEndpointUnavailable:
+            raise
+        except Exception as error:  # ModelError and anything else the client raises
+            logger.error("%s: answering failed: %s", record_id, error)
+            return _answer_record(
+                case, arm, use_role.model, "", use_settings, endpoint_role,
+                isolation, requested, messages=messages,
+                error=f"{type(error).__name__}: {error}", repeat_index=repeat_index,
+            )
+        record = _answer_record(
+            case, arm, response.model or use_role.model, response.text, use_settings,
+            endpoint_role, isolation, requested, messages=messages, response=response,
+            repeat_index=repeat_index,
+        )
+        # latency_s is the model's own request time; wall_s adds the wait for a
+        # concurrency slot. A run whose wall time dwarfs its latency is queueing,
+        # not a slow model, and only the pair distinguishes the two.
+        record["meta"]["wall_s"] = round(time.monotonic() - started, 3)
+        return record
+
+    def collect(results: list[Any], where: str) -> None:
+        for result in results:
+            if isinstance(result, LocalEndpointUnavailable):
+                # The local base endpoint being down is an operator problem, not a
+                # per-case failure: stopping is more useful than 200 empty answers.
+                raise RuntimeError(str(result)) from None
+            if isinstance(result, BaseException):
+                logger.error("answering raised in %s: %s", where, result)
+                continue
+            records.append(result)
+            # Only the answer of record feeds a continuation. A probe repeat must never
+            # become the assistant turn a pressure case pushes back against, or the
+            # pressure test would be run against a reply the suite never recorded.
+            if result.get("text") and not result["meta"]["repeat_index"]:
+                answer_text_by_case[result["case_id"]] = result["text"]
+
     try:
         for depth, level in enumerate(levels):
+            collect(
+                await gather_bounded([answer_one(c, settings, call_role) for c in level]),
+                f"dependency level {depth}",
+            )
 
-            async def answer_one(case: Case) -> dict[str, Any]:
-                isolation = isolation_of(suite, case)
-                requested = case.case_id in requested_ids
-                try:
-                    messages = build_messages(suite, case, answer_text_by_case, settings)
-                except ValueError as error:
-                    # An upstream answer is missing, usually because the original case
-                    # itself failed. Never fabricate the missing turn: record the reason
-                    # and let the report show the continuation as unrun.
-                    logger.error("%s: %s", case.case_id, error)
-                    return _answer_record(
-                        case, arm, call_role.model, "", settings, endpoint_role,
-                        isolation, requested, error=str(error),
-                    )
-                started = time.monotonic()
-                try:
-                    response = await client.complete(
-                        call_role,
-                        messages,
-                        temperature=settings.temperature,
-                        max_tokens=settings.max_tokens,
-                        stage=f"{STAGE}.{arm}",
-                        record_id=case.case_id,
-                    )
-                except LocalEndpointUnavailable:
-                    raise
-                except Exception as error:  # ModelError and anything else the client raises
-                    logger.error("%s: answering failed: %s", case.case_id, error)
-                    return _answer_record(
-                        case, arm, call_role.model, "", settings, endpoint_role,
-                        isolation, requested, messages=messages,
-                        error=f"{type(error).__name__}: {error}",
-                    )
-                record = _answer_record(
-                    case, arm, response.model or call_role.model, response.text, settings,
-                    endpoint_role, isolation, requested, messages=messages, response=response,
-                )
-                # latency_s is the model's own request time; wall_s adds the wait for a
-                # concurrency slot. A run whose wall time dwarfs its latency is queueing,
-                # not a slow model, and only the pair distinguishes the two.
-                record["meta"]["wall_s"] = round(time.monotonic() - started, 3)
-                return record
-
-            results = await gather_bounded([answer_one(case) for case in level])
-            for result in results:
-                if isinstance(result, LocalEndpointUnavailable):
-                    # The local base endpoint being down is an operator problem, not a
-                    # per-case failure: stopping is more useful than 200 empty answers.
-                    raise RuntimeError(str(result)) from None
-                if isinstance(result, BaseException):
-                    logger.error("answering raised at depth %d: %s", depth, result)
-                    continue
-                records.append(result)
-                if result.get("text"):
-                    answer_text_by_case[result["case_id"]] = result["text"]
+        probe_cases = self_consistency_cases(
+            suite,
+            [c for c in all_cases if c.case_id in requested_ids],
+            self_consistency,
+            self_consistency_seed,
+        )
+        if probe_cases:
+            # A configured seed would make the second draw identical to the first and the
+            # probe would report a noise floor of zero for a model that is not
+            # deterministic at all. Offsetting it keeps the draw reproducible AND
+            # independent, which is the whole point of the probe.
+            probe_settings = (
+                settings if settings.seed is None else replace(settings, seed=settings.seed + 1)
+            )
+            probe_role = _role_with_seed(role, probe_settings.seed)
+            logger.info(
+                "arm %s: self-consistency probe on %d original cases", arm, len(probe_cases)
+            )
+            collect(
+                await gather_bounded(
+                    [answer_one(c, probe_settings, probe_role, 1) for c in probe_cases]
+                ),
+                "self-consistency probe",
+            )
     finally:
         if owns_client:
             await client.aclose()
 
     logger.info(
-        "arm %s: %d answers (%d requested, %d pulled in as context) over %d dependency levels",
+        "arm %s: %d answers (%d requested, %d pulled in as context, %d probe repeats) over "
+        "%d dependency levels",
         arm,
         len(records),
-        sum(1 for r in records if r["meta"]["requested"]),
+        sum(1 for r in records if r["meta"]["requested"] and not r["meta"]["repeat_index"]),
         sum(1 for r in records if not r["meta"]["requested"]),
+        sum(1 for r in records if r["meta"]["repeat_index"]),
         len(levels),
     )
     return records
@@ -455,10 +557,17 @@ def settings_disagreement(answers: Sequence[dict[str, Any]]) -> list[str]:
 
     Exposed so the report can make the check rather than trusting that this module made
     it, which is the point of stamping the fingerprint on every answer.
+
+    Self-consistency probe rows are excluded. When a seed is configured the probe
+    deliberately offsets it, so its fingerprint differs by design; counting that as a
+    disagreement would report every seeded run as incomparable with itself.
     """
     seen: dict[str, str] = {}
     for row in answers:
-        settings = (row.get("meta") or {}).get("settings") or {}
+        meta = row.get("meta") or {}
+        if meta.get("repeat_index"):
+            continue
+        settings = meta.get("settings") or {}
         fingerprint = str(settings.get("fingerprint", ""))
         if fingerprint:
             seen.setdefault(fingerprint, row.get("arm", ""))
@@ -472,5 +581,6 @@ __all__ = [
     "dependency_levels",
     "isolation_of",
     "resolve_settings",
+    "self_consistency_cases",
     "settings_disagreement",
 ]

@@ -267,6 +267,10 @@ def _dimension_coverage(analysis: Analysis, suite: Suite) -> list[str]:
             f"| {status(dimension)} |"
         )
 
+    def agree(names: list[str]) -> tuple[str, str]:
+        """Verb and pronoun for a list that is often one item and often several."""
+        return ("is", "it") if len(names) == 1 else ("are", "them")
+
     unreachable = [d for d in DIMENSIONS if not reachable[d]]
     never_chosen = [d for d in DIMENSIONS if reachable[d] and not selected[d]]
     not_returned = [d for d in DIMENSIONS if selected[d] and d not in scored]
@@ -279,31 +283,34 @@ def _dimension_coverage(analysis: Analysis, suite: Suite) -> list[str]:
             "gap in what the suite can see, not a clean record for any arm."
         )
     if never_chosen:
+        _verb, pronoun = agree(never_chosen)
         lines.append(
             "**Sampling, not a gap.** "
             + ", ".join(never_chosen)
-            + " could have been scored but no rubric selected it. Each rubric picks three to "
-            "five of the dimensions its task allows, so at this suite size some reachable "
-            "dimensions go unused. Read the absence as no evidence either way."
+            + f" could have been scored and no rubric selected {pronoun}. Each rubric picks "
+            "three to five of the dimensions its task allows, so at this suite size some "
+            "reachable dimensions go unused. Read the absence as no evidence either way."
         )
     if not_returned:
+        verb, pronoun = agree(not_returned)
         lines.append(
             "**A defect in the run.** "
             + ", ".join(not_returned)
-            + " is scored by at least one rubric and no judgment came back for it. That is worth "
-            "chasing before the numbers above are used."
+            + f" {verb} scored by at least one rubric and no judgment came back for {pronoun}. "
+            "That is worth chasing before the numbers above are used."
         )
-    thin = [
-        d
-        for d in DIMENSIONS
-        if d in scored and reachable[d] and reachable[d] < MIN_CELL_N * 2
-    ]
+    # Below the interpretability floor before a single rubric has chosen anything. This is a
+    # property of which task types the suite uses, not of how the rubrics were written, so
+    # adding families of the same tasks will not fix it.
+    thin = [d for d in DIMENSIONS if 0 < reachable[d] < MIN_CELL_N]
     if thin:
+        verb, _pronoun = agree(thin)
         lines.append(
-            "Low ceiling even before any rubric chose: "
-            + ", ".join(f"{d} ({reachable[d]} cases)" for d in thin)
-            + ". A dimension only a couple of task types permit cannot get a large sample from "
-            "this suite, so its row above will stay thin however many families are added."
+            "**Cannot reach an interpretable sample.** "
+            + ", ".join(f"{d} ({_plural(reachable[d], 'case')})" for d in thin)
+            + f" {verb} permitted by too few cases to clear the {MIN_CELL_N}-case floor even if "
+            f"every one of those rubrics chose it. Only some task types allow these, so more "
+            f"families of the same tasks will not help; more of those task types would."
         )
     return lines
 
@@ -312,6 +319,11 @@ def _diagnostic_scores(analysis: Analysis, suite: Suite) -> list[str]:
     lines = ["", "## Diagnostic scores", ""]
     if not analysis.dimension_stats:
         lines.append("No dimension was scored in this run.")
+        # Still emitted: both read the suite rather than the results, and a reader whose
+        # tables are empty is exactly the one who needs to know whether the suite could have
+        # scored anything in the first place.
+        lines += _dimension_coverage(analysis, suite)
+        lines += _dimension_kind_matrix(analysis)
         return lines
     lines.append(
         "Action and reasoning are separate tables. An arm can recommend a defensible action "

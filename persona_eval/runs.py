@@ -169,17 +169,25 @@ def sampling_signature(config: Any, role_name: str) -> dict[str, Any]:
     The plan requires "compatible generation settings for the baseline and each checkpoint".
     Recording the signature turns that from a promise into something checkable after the run.
     """
+    # Delegated to the answering module rather than re-derived here. Reading the config a
+    # second time is how this went wrong before: this function recorded the role's
+    # temperature and token budget while answering used the `evaluation:` block, so a run
+    # could sample at one setting and certify another. There is one resolver, and both the
+    # answers and this record now come from it.
+    from persona_eval.run.answer import resolve_settings
+
     role = config.role(role_name)
-    evaluation = config.raw.get("evaluation", {}) or {}
+    settings = resolve_settings(config, role)
     return {
         "role": role_name,
         "model": role.model,
         "base_url": role.base_url,
-        "temperature": role.temperature,
-        "max_tokens": role.max_tokens,
-        "top_p": evaluation.get("top_p"),
-        "seed": evaluation.get("seed"),
-        "system_prompt": evaluation.get("system_prompt") or None,
+        "temperature": settings.temperature,
+        "max_tokens": settings.max_tokens,
+        "top_p": settings.top_p,
+        "seed": settings.seed,
+        "system_prompt": settings.system_prompt or None,
+        "max_tokens_source": getattr(settings, "max_tokens_source", None),
     }
 
 

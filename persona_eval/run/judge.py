@@ -74,6 +74,11 @@ NOTE_JUDGE_OMITTED = "judging_failure: judge returned no score for this dimensio
 NOTE_BAD_SCORE = "judging_failure: judge returned a score outside 0/1/2"
 NOTE_CASE_UNSCORABLE = "unscorable: the case was ruled unscorable"
 
+# The measure a self-consistency verdict belongs to. Not in the schema's VARIANT_MEASURES,
+# because it is not a variant: it is the same prompt answered twice, and it is the baseline
+# the four real variant measures are read against.
+SELF_CONSISTENCY = "self_consistency"
+
 JUDGING_FAILURE_PREFIX = "judging_failure:"
 
 # A quotation shorter than this proves nothing: "the" appears in every answer. Below the
@@ -491,6 +496,7 @@ async def judge_cases(
     second_judge_fraction: float = 1.0,
     seed: int = 0,
     client: ModelClient | None = None,
+    include_repeats: bool = False,
 ) -> list[CaseResult]:
     """Grade every answer, then re-grade a sample so reliability can be measured.
 
@@ -516,6 +522,11 @@ async def judge_cases(
 
     jobs: list[tuple[dict[str, Any], Case]] = []
     for row in answers:
+        # Self-consistency probe repeats share a case_id with the answer of record. Grading
+        # both would put two scores on one case and double its weight in every mean. The
+        # probe exists to feed the change judge, not the score tables.
+        if (row.get("meta") or {}).get("repeat_index") and not include_repeats:
+            continue
         try:
             case = suite.case(row["case_id"])
         except Exception:
@@ -729,6 +740,7 @@ async def judge_changes(
     second_judge_fraction: float = 1.0,
     seed: int = 0,
     client: ModelClient | None = None,
+    include_self_consistency: bool = True,
 ) -> list[ChangeVerdict]:
     """One verdict per non-original case that has its original answered in the same arm.
 
@@ -749,15 +761,26 @@ async def judge_changes(
     them: flips within same-order repeats are judge instability, the excess flip rate among
     opposite-order repeats is the position effect. That split needs a repeat sample big
     enough to halve, which is a sizing decision for whoever sets `repeat_fraction`.
+
+    `include_self_consistency` also emits a verdict for every self-consistency probe pair
+    present in `answers`, tagged `measures="self_consistency"` with `should_change=False`.
+    It changes nothing for a caller whose answers carry no probe rows, which is why it
+    defaults to on.
     """
     spec_text = spec if isinstance(spec, str) else render_for_reviewer(spec)
     role = _judge_role(config, judge_role_name)
     second = _judge_role(config, second_judge_role_name) if second_judge_role_name else None
+    # Probe repeats share a case_id with the answer of record, so keying on case_id alone
+    # would let one silently overwrite the other and the variant comparisons would then run
+    # against whichever draw happened to be last.
     by_arm_case: dict[tuple[str, str], dict[str, Any]] = {
-        (str(row.get("arm", "")), row["case_id"]): row for row in answers if row.get("case_id")
+        (str(row.get("arm", "")), row["case_id"]): row
+        for row in answers
+        if row.get("case_id") and not (row.get("meta") or {}).get("repeat_index")
     }
+    probe_rows = [row for row in answers if (row.get("meta") or {}).get("repeat_index")]
 
-    pairs: list[tuple[str, Case, Case, dict[str, Any], dict[str, Any]]] = []
+    pairs: list[tuple[str, Case, Case, dict[str, Any], dict[str, Any], str, str]] = []
     for (arm, case_id), row in sorted(by_arm_case.items()):
         try:
             case = suite.case(case_id)
@@ -773,7 +796,31 @@ async def judge_changes(
         if original_row is None:
             logger.warning("%s: arm %r has no answer for original %s", case_id, arm, original.case_id)
             continue
-        pairs.append((arm, case, original, original_row, row))
+        pairs.append((arm, case, original, original_row, row, "", case.case_id))
+
+    if include_self_consistency:
+        # The noise floor. The same change judge, over two answers to the IDENTICAL prompt,
+        # so `should_change` is False by construction and the rate at which the judge says
+        # the position moved is how often this arm contradicts itself with nothing changed.
+        # Every other family-level rate is read as a difference from this, not as an
+        # absolute: 70% invariance against a 5% floor and against a 30% floor are different
+        # findings, and without the floor there is no way to tell which one you have.
+        for row in sorted(probe_rows, key=lambda r: (str(r.get("arm", "")), str(r.get("answer_id", "")))):
+            arm = str(row.get("arm", ""))
+            case_id = str(row.get("case_id", ""))
+            first_row = by_arm_case.get((arm, case_id))
+            if first_row is None:
+                logger.warning("%s: probe repeat with no answer of record in arm %r", case_id, arm)
+                continue
+            try:
+                case = suite.case(case_id)
+            except Exception:
+                continue
+            pairs.append(
+                (arm, case, case, first_row, row, SELF_CONSISTENCY,
+                 str(row.get("answer_id") or f"{case_id}#r1"))
+            )
+
     if not pairs:
         return []
 
@@ -796,6 +843,8 @@ async def judge_changes(
             original: Case,
             orig_row: dict,
             var_row: dict,
+            measures: str,
+            variant_answer_id: str,
             judge: ModelRole,
             pass_index: int,
         ) -> ChangeVerdict:
@@ -808,7 +857,7 @@ async def judge_changes(
             # repeat is a fresh coin rather than the same one replayed. Both halves are
             # what makes a position-bias audit possible: reproducible so a rerun agrees
             # with itself, independent so pass 0 and pass 1 are comparable evidence.
-            rng = random.Random(f"{suite.version}:{seed}:{arm}:{case.case_id}:{pass_index}")
+            rng = random.Random(f"{suite.version}:{seed}:{arm}:{variant_answer_id}:{pass_index}")
             verdict = await judge_change(
                 client_,
                 spec_text,
@@ -824,6 +873,12 @@ async def judge_changes(
                 pass_index=pass_index,
             )
             verdict.arm = arm
+            # A self-consistency pair is the same case twice, so the fields judge_change
+            # derives from the case are right except for these two: the measure it belongs
+            # to, and the id that tells the two draws apart.
+            if measures:
+                verdict.measures = measures
+            verdict.variant_case_id = variant_answer_id
             return verdict
 
         coroutines = [one(*pair, role, 0) for pair in pairs]
@@ -852,6 +907,7 @@ async def judge_changes(
 
 __all__ = [
     "JUDGING_FAILURE_PREFIX",
+    "SELF_CONSISTENCY",
     "NOTE_BAD_SCORE",
     "NOTE_CASE_UNSCORABLE",
     "NOTE_INAPPLICABLE",

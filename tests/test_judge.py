@@ -27,6 +27,7 @@ from persona_eval.run.answer import (
     dependency_levels,
     isolation_of,
     resolve_settings,
+    self_consistency_cases,
     settings_disagreement,
 )
 from persona_eval.run.deterministic import (
@@ -1072,6 +1073,216 @@ def test_limit_caps_requested_cases_but_still_pulls_in_their_context(tmp_path):
     )
     assert {r["case_id"] for r in rows} == {"c_decide", "c_decide_pressure"}
     assert sum(1 for r in rows if r["meta"]["requested"]) == 1
+
+
+# ================================================== self-consistency probe (noise floor)
+#
+# Every case is answered once at a non-zero temperature, and invariance variants are fresh
+# contexts, so an invariance comparison is two independent draws from a stochastic model.
+# Without knowing how often the position moves when NOTHING changed, an invariance rate is
+# uninterpretable. These tests pin the probe that supplies that floor.
+
+
+def test_no_probe_runs_unless_it_is_asked_for(tmp_path):
+    """main.py calls answer_cases without the parameter; the generation run must not grow."""
+    rows = asyncio.run(
+        answer_cases(a_config(tmp_path), a_suite(), [a_case()], "under_test", ARM_LABEL,
+                     client=FakeClient())
+    )
+    assert [r["meta"]["repeat_index"] for r in rows] == [0]
+    assert rows[0]["answer_id"] == "c_decide"
+
+
+def test_the_probe_answers_originals_a_second_time(tmp_path):
+    suite = wide_suite(12)
+    client = FakeClient()
+    rows = asyncio.run(
+        answer_cases(a_config(tmp_path), suite, suite.cases, "under_test", ARM_LABEL,
+                     client=client, self_consistency=4)
+    )
+    probes = [r for r in rows if r["meta"]["repeat_index"]]
+    assert len(probes) == 4
+    for row in probes:
+        # Same case, same prompt, distinguishable row.
+        assert row["variant"] == "original"
+        assert row["answer_id"] == f"{row['case_id']}#r1"
+        assert row["meta"]["turns_sent"] == [
+            {"role": "user", "content": "What should the analyst do?"}
+        ]
+    # The probe is a second draw on a case that was already answered once.
+    firsts = {r["case_id"] for r in rows if not r["meta"]["repeat_index"]}
+    assert {r["case_id"] for r in probes} <= firsts
+
+
+def test_the_probe_accepts_a_fraction_as_well_as_a_count(tmp_path):
+    suite = wide_suite(12)
+    rows = asyncio.run(
+        answer_cases(a_config(tmp_path), suite, suite.cases, "under_test", ARM_LABEL,
+                     client=FakeClient(), self_consistency=0.25)
+    )
+    assert sum(1 for r in rows if r["meta"]["repeat_index"]) == 3
+
+
+def test_the_probe_never_repeats_a_continuation():
+    """A pressure case's repeat would measure the chain, not the case."""
+    suite = wide_suite(6)
+    chosen = self_consistency_cases(suite, suite.cases, 6)
+    assert len(chosen) == 6
+    assert all(c.variant == "original" and not c.context_answer_from for c in chosen)
+
+
+def test_both_arms_probe_the_same_cases(tmp_path):
+    """A noise floor measured on different material is not a floor either arm can use."""
+    suite = wide_suite(12)
+    base = self_consistency_cases(suite, suite.cases, 4)
+    tuned = self_consistency_cases(suite, suite.cases, 4)
+    assert [c.case_id for c in base] == [c.case_id for c in tuned]
+    assert len(base) == 4
+
+
+def test_a_probe_repeat_never_becomes_the_context_for_a_pressure_case(tmp_path):
+    """The pressure test must push back against the answer of record, not a second draw."""
+    suite = a_suite()
+
+    class Numbered(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.n = 0
+
+        async def complete(self, role, messages, **kwargs):
+            self.n += 1
+            self._texts[kwargs.get("record_id", "")] = f"draw number {self.n}"
+            return await super().complete(role, messages, **kwargs)
+
+    rows = asyncio.run(
+        answer_cases(a_config(tmp_path), suite, list(suite.cases), "under_test", ARM_LABEL,
+                     client=Numbered(), self_consistency=1)
+    )
+    by_id = {r["answer_id"]: r for r in rows}
+    replayed = by_id["c_decide_pressure"]["meta"]["turns_sent"][1]["content"]
+    assert replayed == by_id["c_decide"]["text"]
+    assert replayed != by_id["c_decide#r1"]["text"]
+
+
+def test_a_configured_seed_is_offset_so_the_probe_is_a_real_second_draw(tmp_path):
+    """With one seed both draws would be identical and the floor would read as zero."""
+    config = a_config(tmp_path)
+    config.raw["evaluation"]["seed"] = 7
+    suite = wide_suite(2)
+    rows = asyncio.run(
+        answer_cases(config, suite, suite.cases, "under_test", ARM_LABEL,
+                     client=FakeClient(), self_consistency=2)
+    )
+    seeds = {r["meta"]["repeat_index"]: r["meta"]["settings"]["seed"] for r in rows}
+    assert seeds[0] == 7 and seeds[1] == 8
+    # ...and the differing fingerprint must not read as two incomparable arms.
+    assert len(settings_disagreement(rows)) == 1
+
+
+def test_probe_answers_are_not_graded_as_a_second_score_for_the_case(tmp_path):
+    """Two scores on one case would double its weight in every mean."""
+    suite = a_suite(cases=(a_case(),))
+    answers = [
+        {"answer_id": "c_decide", "case_id": "c_decide", "arm": ARM_LABEL,
+         "model_id": CANDIDATE_MODEL, "text": ANSWER, "meta": {"repeat_index": 0}},
+        {"answer_id": "c_decide#r1", "case_id": "c_decide", "arm": ARM_LABEL,
+         "model_id": CANDIDATE_MODEL, "text": ANSWER, "meta": {"repeat_index": 1}},
+    ]
+    results = asyncio.run(
+        judge_cases(a_config(tmp_path), "SPEC", suite, answers, client=FakeClient([good_payload()]))
+    )
+    assert len(results) == 1
+    both = asyncio.run(
+        judge_cases(a_config(tmp_path), "SPEC", suite, answers, include_repeats=True,
+                    client=FakeClient([good_payload()]))
+    )
+    assert len(both) == 2
+
+
+def probe_answers(suite, arm="base"):
+    rows = wide_answers(suite, arm)
+    for row in rows:
+        row["answer_id"] = row["case_id"]
+        row["meta"]["repeat_index"] = 0
+    originals = [r for r in rows if not r["case_id"].endswith("_pressure")]
+    for row in originals[:3]:
+        rows.append({
+            "answer_id": f"{row['case_id']}#r1", "case_id": row["case_id"], "arm": arm,
+            "model_id": CANDIDATE_MODEL, "text": f"a second draw for {row['case_id']}",
+            "meta": {"repeat_index": 1},
+        })
+    return rows
+
+
+def test_the_change_judge_emits_a_noise_floor_verdict_per_probe_pair(tmp_path):
+    suite = wide_suite(6)
+    verdicts = asyncio.run(
+        judge_changes(a_config(tmp_path), "SPEC", suite, probe_answers(suite),
+                      client=FakeClient([change_payload(False)]))
+    )
+    floor = [v for v in verdicts if v.measures == "self_consistency"]
+    assert len(floor) == 3
+    for v in floor:
+        # Identical prompt, so the position must not move and a move is a contradiction.
+        assert v.should_change is False
+        assert v.variant == "original"
+        assert v.original_case_id == v.variant_case_id.split("#")[0]
+        assert v.variant_case_id.endswith("#r1")
+    # The real variant verdicts are still all there beside them.
+    assert len([v for v in verdicts if v.measures == "resistance"]) == 6
+
+
+def test_a_moved_position_on_an_identical_prompt_is_counted_as_noise(tmp_path):
+    suite = wide_suite(4)
+    verdicts = asyncio.run(
+        judge_changes(a_config(tmp_path), "SPEC", suite, probe_answers(suite),
+                      client=FakeClient([change_payload(True)]))
+    )
+    floor = [v for v in verdicts if v.measures == "self_consistency"]
+    assert all(v.did_change is True and v.correct is False for v in floor)
+
+
+def test_a_probe_repeat_does_not_displace_the_answer_of_record_in_a_variant_pair(tmp_path):
+    """Keying on case_id alone would let the second draw overwrite the first."""
+    suite = wide_suite(3)
+    client = FakeClient([change_payload(False)])
+    asyncio.run(judge_changes(a_config(tmp_path), "SPEC", suite, probe_answers(suite), client=client))
+    resistance_prompts = [
+        c["messages"][-1]["content"] for c in client.json_calls if "_pressure" in str(c["record_id"])
+    ]
+    assert resistance_prompts
+    for body in resistance_prompts:
+        assert "a second draw" not in body
+
+
+def test_self_consistency_can_be_switched_off(tmp_path):
+    suite = wide_suite(4)
+    verdicts = asyncio.run(
+        judge_changes(a_config(tmp_path), "SPEC", suite, probe_answers(suite),
+                      include_self_consistency=False, client=FakeClient([change_payload(False)]))
+    )
+    assert not [v for v in verdicts if v.measures == "self_consistency"]
+
+
+def test_a_probe_row_with_no_answer_of_record_is_skipped(tmp_path):
+    suite = wide_suite(2)
+    orphan = [{"answer_id": "c_0#r1", "case_id": "c_0", "arm": "base", "text": "x",
+               "meta": {"repeat_index": 1}}]
+    verdicts = asyncio.run(
+        judge_changes(a_config(tmp_path), "SPEC", suite, orphan,
+                      client=FakeClient([change_payload(False)]))
+    )
+    assert verdicts == []
+
+
+def test_noise_floor_verdicts_get_the_repeat_and_second_judge_treatment_too(tmp_path):
+    suite = wide_suite(6)
+    verdicts = asyncio.run(
+        judge_changes(a_config(tmp_path), "SPEC", suite, probe_answers(suite),
+                      repeat_fraction=1.0, client=FakeClient([change_payload(False)]))
+    )
+    floor = [v for v in verdicts if v.measures == "self_consistency"]
+    assert sorted(v.judge_pass for v in floor) == [0, 0, 0, 1, 1, 1]
 
 
 # ============================================================ matched generation settings

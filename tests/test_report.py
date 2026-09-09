@@ -1163,28 +1163,52 @@ def test_judges_that_never_overlap_cannot_be_compared(basic_suite: Suite) -> Non
 # ------------------------------------------------------- coverage and empty denominators
 
 
-def test_an_unreachable_dimension_is_called_a_structural_gap(basic_suite: Suite) -> None:
-    """No task in this suite permits context_sensitivity, so no answer could have scored it."""
-    results = [make_result(basic_suite.case("fam_work.decide.original"), "base", {"action_judgment": 2})]
-    analysis = analyse(basic_suite, results)
-    text = render_report(analysis, basic_suite, {})
+BOUNDARIES_DIMENSIONS = ("relevance_boundaries", "reasoning_fidelity", "proportionality")
+
+
+def test_an_unreachable_dimension_is_called_a_structural_gap() -> None:
+    """A suite of one task type cannot score the dimensions that task does not allow.
+
+    Built from `boundaries` cases alone, which TASK_DIMENSIONS permits only four dimensions on,
+    so the other six could not be scored however any model answered.
+    """
+    family = make_family("fam_b")
+    case = make_case(
+        "fam_b.boundaries.original",
+        "fam_b",
+        task="boundaries",
+        dimensions=BOUNDARIES_DIMENSIONS,
+    )
+    suite = make_suite([family], [case])
+    assert suite.validate() == []
+    analysis = analyse(suite, [make_result(case, "base", {"relevance_boundaries": 2})])
+    text = render_report(analysis, suite, {})
     assert "**A structural gap.**" in text
-    assert "context_sensitivity" in text.split("**A structural gap.**")[1].split(".")[0]
+    sentence = text.split("**A structural gap.**")[1].split(".")[0]
+    for absent in ("action_judgment", "prioritization", "uncertainty", "context_sensitivity"):
+        assert absent in sentence
     assert "not a clean record for any arm" in text
-    assert "| context_sensitivity | reasoning | 0 | 0 | **unreachable** |" in text
+    assert "| action_judgment | action | 0 | 0 | **unreachable** |" in text
+    # salience is allowed by boundaries but this rubric did not choose it: a different cause.
+    assert "| salience | reasoning | 1 | 0 | reachable, never chosen |" in text
 
 
 def test_a_reachable_dimension_no_rubric_chose_is_called_sampling(basic_suite: Suite) -> None:
-    """The correction that matters: an unused reachable dimension is not a design gap."""
+    """The correction that matters: an unused reachable dimension is not a design gap.
+
+    This suite's two task types between them allow all ten dimensions, so nothing is a
+    structural gap and the four no rubric picked must not be described as one.
+    """
     results = [make_result(basic_suite.case("fam_work.decide.original"), "base", {"action_judgment": 2})]
     analysis = analyse(basic_suite, results)
     text = render_report(analysis, basic_suite, {})
+    assert "**A structural gap.**" not in text
+    assert "**unreachable**" not in text
     assert "**Sampling, not a gap.**" in text
     sentence = text.split("**Sampling, not a gap.**")[1].split(".")[0]
-    # decide allows proportionality; notice allows roles_relationships; no rubric picks either.
-    assert "proportionality" in sentence and "roles_relationships" in sentence
+    for unused in ("roles_relationships", "conflict_recognition", "context_sensitivity", "proportionality"):
+        assert unused in sentence
     assert "no evidence either way" in text
-    assert "**Sampling, not a gap.**" not in text.split("**A structural gap.**")[0]
 
 
 def test_the_dimension_ceiling_is_counted_from_the_suite(basic_suite: Suite) -> None:
@@ -1197,8 +1221,9 @@ def test_the_dimension_ceiling_is_counted_from_the_suite(basic_suite: Suite) -> 
     assert "| roles_relationships | reasoning | 5 | 0 | reachable, never chosen |" in text
     # allowed by notice (2) only, and chosen there
     assert "| uncertainty | reasoning | 2 | 2 |" in text
-    assert "Low ceiling even before any rubric chose" in text
+    assert "**Cannot reach an interpretable sample.**" in text
     assert "uncertainty (2 cases)" in text
+    assert "more families of the same tasks will not help" in text
 
 
 def test_a_dimension_chosen_but_never_returned_is_a_run_defect(basic_suite: Suite) -> None:

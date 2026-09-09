@@ -29,9 +29,15 @@ class _Role:
 
 
 class _Config:
+    """Enough of RunConfig for the signature resolver, which reads `config.evaluation`."""
+
     def __init__(self, roles, evaluation):
         self._roles = roles
         self.raw = {"evaluation": evaluation}
+
+    @property
+    def evaluation(self):
+        return self.raw.get("evaluation", {})
 
     def role(self, name):
         return self._roles[name]
@@ -69,6 +75,9 @@ def test_arms_present_reads_the_directory(tmp_path: Path):
 
 
 def test_settings_match_catches_an_unfair_comparison():
+    # No `temperature` in the evaluation block, so each role's own temperature is used and a
+    # divergent role is visible. This mirrors the real failure: the record must reflect what
+    # answering resolves, not what the config nominally says.
     evaluation = {"top_p": 0.95, "seed": 13}
     config = _Config(
         {
