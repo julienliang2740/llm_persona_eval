@@ -10,3 +10,10 @@ hugging_face_token.txt
 *token*.txt
 *_token
 *.token
+
+# Evaluation artifacts are committed on purpose: the suite is the frozen standard a result
+# was measured against, and the answers and grading records are the evidence for it. Only
+# the bulky intermediates are ignored.
+suites/*.usage.jsonl
+results/*/usage.jsonl
+results/*/log.txt

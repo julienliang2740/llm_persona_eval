@@ -1,14 +1,27 @@
 #!/usr/bin/env python
-"""Evaluation CLI.
+"""Evaluation CLI for llm_persona.
 
-    python main.py evaluate --target confucian --endpoint-role base --label before
-    python main.py evaluate --target confucian --answers-file ../llm_persona_training/out/answers.jsonl --label after
-    python main.py compare  --target confucian --before <eval_results_before.jsonl> --after <eval_results_after.jsonl>
+Build a held-out evaluation suite from a value specification, answer it with two or more
+model arms under identical settings, grade every answer against frozen per-case rubrics, and
+report the diagnostics separately instead of collapsing them into one score.
 
-Reads the pipeline run directory (runs/<target>/<run_id>/ in llm_persona_data_pipeline, the
-latest run unless --run is given), judges answers against its eval.jsonl, and writes
-eval_results_<label>.jsonl and before_after.md next to it, so results stay with the export
-they were scored against. Model roles and the judge come from the pipeline config.
+    python main.py author  --target confucian --out suites/confucian-v1.json
+    python main.py inspect --suite suites/confucian-v1.json
+    python main.py run     --suite suites/confucian-v1.json --arms base=base,adapter=adapter
+    python main.py report  --run <run_id>
+
+Stage by stage, if you want to drive it yourself:
+
+    python main.py answer     --suite <path> --run <id> --arm base --role base
+    python main.py judge      --run <id> --arm base
+    python main.py capability --run <id> --arm base --role base
+
+Arms are `label=config_role` pairs. Both arms in this project are the same Q4 base model
+served by llama.cpp, one with the LoRA adapter applied, so `--arms base=base,adapter=adapter`
+compares exactly one difference.
+
+`evaluate` and `compare` are the older single-score commands, kept for the pipeline's own
+eval.jsonl exports. New work should use the commands above; docs/DESIGN.md says why.
 """
 
 from __future__ import annotations
@@ -19,99 +32,509 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import Any, Sequence
 
-from persona_eval import PIPELINE_ROOT  # noqa: F401  (puts the pipeline on sys.path)
-from persona_eval import evaluate
+from persona_eval import PIPELINE_ROOT
+from persona_eval import evaluate as legacy_evaluate
+from persona_eval import runs
+from persona_eval.report.aggregate import analyse
+from persona_eval.report.render import render_report
+from persona_eval.run.answer import answer_cases, settings_disagreement
+from persona_eval.run.judge import judge_cases, judge_changes
+from persona_eval.suite import io as suite_io
+from persona_eval.suite.author import SuitePlan, author_suite
+from persona_eval.suite.contamination import (
+    contamination_summary,
+    lexical_contamination,
+    load_training_prompts,
+)
+from persona_eval.suite.external import fetch_daily_dilemmas
+from persona_eval.suite.review import apply_reviews, review_suite
+from persona_eval.suite.schema import CaseResult, ChangeVerdict, Suite
 
 from pipeline import records
 from pipeline.config import ConfigError, load_config, resolve_run_dir
 from pipeline.target import SpecError, load_target
 
+logger = logging.getLogger("persona_eval.main")
 
-def configure_logging(run_dir: Path, verbose: bool) -> None:
-    """Log to stdout and append to the run's log.txt, as the pipeline stages do."""
-    level = logging.DEBUG if verbose else logging.INFO
-    formatter = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", "%H:%M:%S")
-    root = logging.getLogger()
-    root.setLevel(level)
-    for handler in list(root.handlers):
-        root.removeHandler(handler)
-    stream = logging.StreamHandler(sys.stdout)
-    stream.setFormatter(formatter)
-    root.addHandler(stream)
-    file_handler = logging.FileHandler(run_dir / records.LOG_FILE, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    root.addHandler(file_handler)
-    for noisy in ("httpx", "httpcore", "httpcore.http11", "httpcore.connection"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_CONFIG = REPO_ROOT / "configs" / "eval.yaml"
+DEFAULT_TRAINING = PIPELINE_ROOT / "runs" / "confucian" / "pooled-confucian-v2" / "sft_train.jsonl"
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="main.py", description="Evaluate a run's held-out set.")
-    parser.add_argument("command", choices=("evaluate", "compare"))
-    parser.add_argument("--target", required=True, help="target id, a directory under the pipeline's targets/")
-    parser.add_argument("--config", default="configs/pilot.yaml", help="pipeline config, relative to the pipeline repo")
-    parser.add_argument("--run", default=None, help="run id; defaults to the latest run for this target")
-    parser.add_argument("--targets-dir", default=None, help="override where targets/ is read from")
-    parser.add_argument(
-        "--endpoint-role",
-        "--endpoint",
-        dest="endpoint_role",
-        default="base",
-        help="evaluate: which configured model role to run over eval.jsonl",
+# --------------------------------------------------------------------------- shared setup
+
+
+def load_eval_config(path: str | Path):
+    """Load an eval config. Paths resolve against this repo; the pipeline supplies keys."""
+    config_path = Path(path)
+    if not config_path.is_absolute():
+        local = REPO_ROOT / config_path
+        config_path = local if local.exists() else config_path
+    return load_config(config_path, repo_root=PIPELINE_ROOT)
+
+
+def load_spec(config, target: str, targets_dir: str | None = None):
+    directory = Path(targets_dir) if targets_dir else config.targets_dir
+    return load_target(directory, target, strict=bool(config.raw.get("strict_specs", False)))
+
+
+def parse_arms(text: str) -> list[tuple[str, str]]:
+    """`base=base,adapter=adapter` -> [(label, role), ...]. A bare name means label == role."""
+    arms: list[tuple[str, str]] = []
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        label, _, role = chunk.partition("=")
+        arms.append((label.strip(), (role or label).strip()))
+    if not arms:
+        raise SystemExit("--arms needs at least one label=role pair")
+    return arms
+
+
+def training_prompts(path: str | Path | None) -> list[str]:
+    source = Path(path) if path else DEFAULT_TRAINING
+    if not source.is_file():
+        logger.warning("training prompts not found at %s; contamination check will be empty", source)
+        return []
+    return load_training_prompts(source)
+
+
+# -------------------------------------------------------------------------------- author
+
+
+async def cmd_author(args: argparse.Namespace) -> int:
+    config = load_eval_config(args.config)
+    spec = load_spec(config, args.target, args.targets_dir)
+    out = Path(args.out) if args.out else runs.SUITES_DIR / f"{args.target}-{runs.new_run_id()}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    usage_path = out.parent / f"{out.stem}.usage.jsonl"
+
+    overrides: dict[str, Any] = {}
+    if args.external:
+        overrides["external_situations"] = args.external
+    plan = SuitePlan.default(spec, scale=args.scale, **overrides)
+    for kind_count in args.families or []:
+        kind, _, count = kind_count.partition("=")
+        plan.families_per_kind[kind.strip()] = int(count)
+    problems = plan.validate()
+    if problems:
+        raise SystemExit("plan problems:\n  - " + "\n  - ".join(problems))
+    logger.info(
+        "authoring %s: %s families, %d cases planned",
+        args.target,
+        sum(plan.families_per_kind.values()),
+        sum(
+            count * sum(len(cell.variants) for cell in plan.coverage_for(kind))
+            for kind, count in plan.families_per_kind.items()
+        ),
     )
-    parser.add_argument(
-        "--answers-file",
-        default=None,
-        help="evaluate: judge answers generated elsewhere instead of calling a model. "
-        "Rows are {prompt_id, prompt, model, text}.",
+
+    external = ()
+    if plan.external_situations:
+        external = await fetch_daily_dilemmas(limit=plan.external_situations * 3)
+        logger.info("fetched %d external situations", len(external))
+
+    known = training_prompts(args.training_prompts)
+    suite, report = await author_suite(
+        config, spec, plan, usage_path=usage_path, external=external, training_prompts=known,
+        situations_role=args.situations_role, rubric_role=args.rubric_role,
     )
-    parser.add_argument("--label", default=None, help="evaluate: name for this result file")
-    parser.add_argument("--before", default=None, help="compare: earlier eval_results_*.jsonl")
-    parser.add_argument("--after", default=None, help="compare: later eval_results_*.jsonl")
-    parser.add_argument("-v", "--verbose", action="store_true")
-    return parser
 
-
-async def run(args: argparse.Namespace) -> int:
-    config = load_config(args.config)
-    targets_dir = Path(args.targets_dir) if args.targets_dir else config.targets_dir
-    run_dir = resolve_run_dir(config, args.target, args.run)
-    configure_logging(run_dir, args.verbose)
-
-    if args.command == "compare":
-        if not (args.before and args.after):
-            print("error: compare needs --before and --after", file=sys.stderr)
-            return 2
-        table = evaluate.write_before_after(
-            Path(args.before), Path(args.after), run_dir / "before_after.md"
+    if not args.no_review:
+        reviews = await review_suite(config, spec, suite, reviewer_role=args.review_role, usage_path=usage_path)
+        suite, review_report = apply_reviews(suite, reviews)
+        report["rubric_review"] = review_report
+        runs.write_jsonl(out.parent / f"{out.stem}.reviews.jsonl", reviews)
+        logger.info(
+            "rubric review: kept %d, dropped %d (%s)",
+            review_report["kept"],
+            review_report["dropped"],
+            review_report["blocking_defect_counts"] or "no blocking defects",
         )
-        print(table)
-        return 0
 
-    spec = load_target(targets_dir, args.target, strict=bool(config.raw.get("strict_specs")))
-    summary = await evaluate.run_stage(
-        config,
-        spec,
-        run_dir,
-        args.endpoint_role,
-        args.label,
-        Path(args.answers_file) if args.answers_file else None,
-    )
-    print(json.dumps({"run_dir": str(run_dir), "evaluate": summary}, indent=2, default=str))
+    problems = suite.validate()
+    if problems:
+        logger.error("authored suite does not validate:\n  - %s", "\n  - ".join(problems[:20]))
+        return 2
+
+    contamination = lexical_contamination(suite, known) if known else []
+    report["contamination"] = contamination_summary(contamination) if contamination else {"checked": 0}
+    suite_io.save_suite(suite, out)
+    runs.write_json(out.parent / f"{out.stem}.authoring.json", report)
+    if contamination:
+        runs.write_jsonl(out.parent / f"{out.stem}.contamination.jsonl", contamination)
+
+    summary = suite_io.suite_summary(suite)
+    print(json.dumps({"suite": str(out), **summary}, indent=2)[:2000])
+    print(f"\nauthoring report: {out.parent / (out.stem + '.authoring.json')}")
     return 0
 
 
-def main() -> int:
-    args = build_parser().parse_args()
-    try:
-        return asyncio.run(run(args))
-    except (ConfigError, SpecError, RuntimeError) as error:
-        print(f"error: {error}", file=sys.stderr)
+def cmd_inspect(args: argparse.Namespace) -> int:
+    """Validate a suite and check it against training data. No model calls, no cost."""
+    suite = suite_io.load_suite(args.suite)
+    problems = suite.validate()
+    summary = suite_io.suite_summary(suite)
+    known = training_prompts(args.training_prompts)
+    contamination = lexical_contamination(suite, known) if known else []
+    print(json.dumps(summary, indent=2))
+    if contamination:
+        print("\ncontamination vs training data:")
+        print(json.dumps(contamination_summary(contamination), indent=2))
+        worst = sorted(contamination, key=lambda r: -r.get("max_similarity", 0))[:5]
+        for row in worst:
+            print(f"  {row.get('case_id')}: max_similarity={row.get('max_similarity'):.3f}")
+    if problems:
+        print(f"\n{len(problems)} validation problems:")
+        for problem in problems[:20]:
+            print(f"  - {problem}")
         return 2
-    except KeyboardInterrupt:
-        print("interrupted", file=sys.stderr)
-        return 130
+    print("\nsuite validates.")
+    return 0
+
+
+# ------------------------------------------------------------------------------- running
+
+
+async def cmd_answer(args: argparse.Namespace) -> int:
+    config = load_eval_config(args.config)
+    suite = suite_io.load_suite(args.suite)
+    directory = runs.run_dir(args.run or runs.new_run_id())
+    runs.configure_logging(directory, args.verbose)
+    suite_io.save_suite(suite, directory / runs.SUITE_COPY)
+
+    answers = await answer_cases(
+        config,
+        suite,
+        suite.cases,
+        endpoint_role=args.role,
+        arm=args.arm,
+        usage_path=directory / runs.USAGE_FILE,
+        limit=args.limit,
+    )
+    path = runs.answers_path(directory, args.arm)
+    runs.write_jsonl(path, answers)
+    signature = runs.sampling_signature(config, args.role)
+    runs.record_stage(directory, f"answer_{args.arm}", {"n": len(answers), "settings": signature, "path": str(path)})
+    print(f"{len(answers)} answers -> {path}")
+    return 0
+
+
+async def cmd_judge(args: argparse.Namespace) -> int:
+    config = load_eval_config(args.config)
+    directory = runs.run_dir(args.run)
+    runs.configure_logging(directory, args.verbose)
+    suite = suite_io.load_suite(directory / runs.SUITE_COPY)
+    spec = load_spec(config, args.target, args.targets_dir)
+    answers = runs.read_jsonl(runs.answers_path(directory, args.arm))
+    if not answers:
+        raise SystemExit(f"no answers for arm {args.arm!r} in {directory}")
+
+    results = await judge_cases(
+        config,
+        spec,
+        suite,
+        answers,
+        judge_role_name=args.judge_role,
+        usage_path=directory / runs.USAGE_FILE,
+        repeat_fraction=args.repeat_fraction,
+        second_judge_role_name=args.second_judge_role,
+        second_judge_fraction=args.second_judge_fraction,
+    )
+    runs.write_jsonl(runs.results_path(directory, args.arm), results)
+
+    verdicts = await judge_changes(
+        config, spec, suite, answers, judge_role_name=args.judge_role, usage_path=directory / runs.USAGE_FILE
+    )
+    runs.write_jsonl(runs.changes_path(directory, args.arm), verdicts)
+    runs.record_stage(
+        directory,
+        f"judge_{args.arm}",
+        {"results": len(results), "verdicts": len(verdicts), "judge_role": args.judge_role},
+    )
+    print(f"{len(results)} graded, {len(verdicts)} change verdicts -> {directory}")
+    return 0
+
+
+async def cmd_capability(args: argparse.Namespace) -> int:
+    from persona_eval.capability.checks import run_capability, summarise
+
+    config = load_eval_config(args.config)
+    directory = runs.run_dir(args.run)
+    runs.configure_logging(directory, args.verbose)
+    rows = await run_capability(
+        config, endpoint_role=args.role, arm=args.arm, usage_path=directory / runs.USAGE_FILE, limit=args.limit
+    )
+    runs.write_jsonl(runs.capability_path(directory, args.arm), rows)
+    summary = summarise(rows)
+    runs.record_stage(directory, f"capability_{args.arm}", summary)
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def _load_results(directory: Path, arm: str) -> list[CaseResult]:
+    return [CaseResult.from_dict(row) for row in runs.read_jsonl(runs.results_path(directory, arm))]
+
+
+def _load_verdicts(directory: Path, arm: str) -> list[ChangeVerdict]:
+    return [ChangeVerdict.from_dict(row) for row in runs.read_jsonl(runs.changes_path(directory, arm))]
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    config = load_eval_config(args.config)
+    directory = runs.run_dir(args.run)
+    suite = suite_io.load_suite(directory / runs.SUITE_COPY)
+    arms = runs.arms_present(directory)
+    if not arms:
+        raise SystemExit(f"no graded arms in {directory}")
+
+    results: list[CaseResult] = []
+    verdicts: list[ChangeVerdict] = []
+    capability: list[dict[str, Any]] = []
+    for arm in arms:
+        results += _load_results(directory, arm)
+        verdicts += _load_verdicts(directory, arm)
+        capability += runs.read_jsonl(runs.capability_path(directory, arm))
+
+    analysis = analyse(
+        suite,
+        results,
+        verdicts,
+        capability=capability,
+        baseline_arm=args.baseline if args.baseline in arms else arms[0],
+        curator_judge=args.curator_judge,
+    )
+    record = runs.read_record(directory)
+    signatures = [
+        stage.get("settings")
+        for name, stage in (record.get("stages") or {}).items()
+        if name.startswith("answer_") and stage.get("settings")
+    ]
+    matched, mismatches = runs.settings_match(signatures)
+    meta = {
+        "run_id": args.run,
+        "run_dir": str(directory),
+        "arms": arms,
+        "baseline": args.baseline if args.baseline in arms else arms[0],
+        "settings_matched": matched,
+        "settings_mismatches": mismatches,
+        "sampling": signatures,
+        "suite_version": suite.version,
+        "spec_version": suite.spec_version,
+        "config": str(config.path),
+        "authoring": suite.authoring,
+    }
+    runs.write_json(directory / runs.ANALYSIS_FILE, analysis)
+    text = render_report(analysis, suite, meta)
+    (directory / runs.REPORT_FILE).write_text(text)
+    runs.record_stage(directory, "report", {"arms": arms, "settings_matched": matched})
+    print(f"report -> {directory / runs.REPORT_FILE}")
+    if not matched:
+        print("WARNING: arms did not share generation settings: " + "; ".join(mismatches))
+    return 0
+
+
+async def cmd_run(args: argparse.Namespace) -> int:
+    """Everything, in order, one arm at a time.
+
+    Arms run sequentially on purpose: both local endpoints are llama.cpp servers on the same
+    eight cores, so answering two arms at once halves each one's throughput and buys nothing.
+    """
+    config = load_eval_config(args.config)
+    suite = suite_io.load_suite(args.suite)
+    spec = load_spec(config, args.target, args.targets_dir)
+    arms = parse_arms(args.arms)
+    run_id = args.run or runs.new_run_id()
+    directory = runs.run_dir(run_id)
+    runs.configure_logging(directory, args.verbose)
+    suite_io.save_suite(suite, directory / runs.SUITE_COPY)
+    usage_path = directory / runs.USAGE_FILE
+    runs.write_record(
+        directory,
+        {
+            "run_id": run_id,
+            "suite": str(args.suite),
+            "suite_version": suite.version,
+            "target": args.target,
+            "arms": [label for label, _ in arms],
+            "config": str(config.path),
+            "started_utc": runs.now_utc(),
+        },
+    )
+    logger.info("run %s | suite %s | %d cases | arms %s", run_id, suite.suite_id, len(suite.cases), arms)
+
+    for label, role in arms:
+        logger.info("---- arm %s (role %s): answering %d cases", label, role, len(suite.cases))
+        answers = await answer_cases(
+            config, suite, suite.cases, endpoint_role=role, arm=label, usage_path=usage_path, limit=args.limit
+        )
+        runs.write_jsonl(runs.answers_path(directory, label), answers)
+        runs.record_stage(
+            directory,
+            f"answer_{label}",
+            {"n": len(answers), "settings": runs.sampling_signature(config, role),
+             "disagreements": settings_disagreement(answers)},
+        )
+        if not args.skip_capability:
+            from persona_eval.capability.checks import run_capability, summarise
+
+            logger.info("---- arm %s: capability checks", label)
+            rows = await run_capability(config, endpoint_role=role, arm=label, usage_path=usage_path)
+            runs.write_jsonl(runs.capability_path(directory, label), rows)
+            runs.record_stage(directory, f"capability_{label}", summarise(rows))
+
+    for label, _ in arms:
+        answers = runs.read_jsonl(runs.answers_path(directory, label))
+        logger.info("---- arm %s: grading %d answers", label, len(answers))
+        results = await judge_cases(
+            config, spec, suite, answers,
+            judge_role_name=args.judge_role,
+            usage_path=usage_path,
+            repeat_fraction=args.repeat_fraction,
+            second_judge_role_name=args.second_judge_role,
+            second_judge_fraction=args.second_judge_fraction,
+        )
+        runs.write_jsonl(runs.results_path(directory, label), results)
+        verdicts = await judge_changes(
+            config, spec, suite, answers, judge_role_name=args.judge_role, usage_path=usage_path
+        )
+        runs.write_jsonl(runs.changes_path(directory, label), verdicts)
+        runs.record_stage(directory, f"judge_{label}", {"results": len(results), "verdicts": len(verdicts)})
+
+    report_args = argparse.Namespace(
+        config=args.config, run=run_id, baseline=arms[0][0], curator_judge=args.curator_judge, verbose=args.verbose
+    )
+    cmd_report(report_args)
+    return 0
+
+
+# -------------------------------------------------------------------------------- legacy
+
+
+async def run_legacy(args: argparse.Namespace) -> int:
+    config = load_config(args.config, repo_root=PIPELINE_ROOT)
+    targets_dir = Path(args.targets_dir) if args.targets_dir else config.targets_dir
+    spec = load_target(targets_dir, args.target, strict=bool(config.raw.get("strict_specs")))
+    run_dir = resolve_run_dir(config, args.target, args.run)
+    runs.configure_logging(run_dir, args.verbose)
+    if args.command == "evaluate":
+        summary = await legacy_evaluate.run_stage(
+            config, spec, run_dir,
+            endpoint_role=None if args.answers_file else args.endpoint_role,
+            label=args.label,
+            answers_file=Path(args.answers_file) if args.answers_file else None,
+        )
+        print(json.dumps(summary, indent=2))
+        return 0
+    legacy_evaluate.write_before_after(run_dir, Path(args.before), Path(args.after))
+    return 0
+
+
+# ----------------------------------------------------------------------------------- cli
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="main.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def common(p, target=True):
+        p.add_argument("--config", default=str(DEFAULT_CONFIG))
+        if target:
+            p.add_argument("--target", default="confucian")
+            p.add_argument("--targets-dir", default=None)
+        p.add_argument("-v", "--verbose", action="store_true")
+        return p
+
+    p = common(sub.add_parser("author", help="write a held-out evaluation suite from a value specification"))
+    p.add_argument("--out", default=None)
+    p.add_argument("--scale", type=int, default=1, help="whole multiples of the default family counts")
+    p.add_argument("--families", action="append", default=None, metavar="KIND=N", help="override one family count")
+    p.add_argument("--external", type=int, default=0, help="families seeded from a public dataset")
+    p.add_argument("--training-prompts", default=None)
+    p.add_argument("--no-review", action="store_true", help="skip the rubric audit (not recommended)")
+    p.add_argument("--review-role", default="judge")
+    p.add_argument("--situations-role", default="author_situations", help="model role that invents situations; runs warm")
+    p.add_argument("--rubric-role", default="author_rubric", help="model role that writes rubrics; runs cold")
+
+    p = common(sub.add_parser("inspect", help="validate a suite and check it against training data"), target=False)
+    p.add_argument("--suite", required=True)
+    p.add_argument("--training-prompts", default=None)
+
+    p = common(sub.add_parser("answer", help="answer a suite with one arm"))
+    p.add_argument("--suite", required=True)
+    p.add_argument("--run", default=None)
+    p.add_argument("--arm", required=True)
+    p.add_argument("--role", required=True)
+    p.add_argument("--limit", type=int, default=None)
+
+    p = common(sub.add_parser("judge", help="grade one arm's answers and judge its variant changes"))
+    p.add_argument("--run", required=True)
+    p.add_argument("--arm", required=True)
+    p.add_argument("--judge-role", default="judge")
+    p.add_argument("--second-judge-role", default=None)
+    p.add_argument("--second-judge-fraction", type=float, default=1.0)
+    p.add_argument("--repeat-fraction", type=float, default=0.0)
+
+    p = common(sub.add_parser("capability", help="run the general-capability checks for one arm"))
+    p.add_argument("--run", required=True)
+    p.add_argument("--arm", required=True)
+    p.add_argument("--role", required=True)
+    p.add_argument("--limit", type=int, default=None)
+
+    p = common(sub.add_parser("report", help="analyse a run and render its report"), target=False)
+    p.add_argument("--run", required=True)
+    p.add_argument("--baseline", default="base")
+    p.add_argument("--curator-judge", default=None, help="judge model that also curated the training data")
+
+    p = common(sub.add_parser("run", help="answer, grade and report every arm, in order"))
+    p.add_argument("--suite", required=True)
+    p.add_argument("--run", default=None)
+    p.add_argument("--arms", default="base=base,adapter=adapter")
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--judge-role", default="judge")
+    p.add_argument("--second-judge-role", default=None)
+    p.add_argument("--second-judge-fraction", type=float, default=1.0)
+    p.add_argument("--repeat-fraction", type=float, default=0.0)
+    p.add_argument("--curator-judge", default=None)
+    p.add_argument("--skip-capability", action="store_true")
+
+    for name in ("evaluate", "compare"):
+        p = common(sub.add_parser(name, help="legacy: single-score judging of a pipeline run's eval.jsonl"))
+        p.set_defaults(config="configs/pilot.yaml")
+        p.add_argument("--run", default=None)
+        p.add_argument("--endpoint-role", "--endpoint", dest="endpoint_role", default="base")
+        p.add_argument("--answers-file", default=None)
+        p.add_argument("--label", default=None)
+        p.add_argument("--before", default=None)
+        p.add_argument("--after", default=None)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", stream=sys.stdout)
+    args = build_parser().parse_args(argv)
+    try:
+        if args.command == "author":
+            return asyncio.run(cmd_author(args))
+        if args.command == "inspect":
+            return cmd_inspect(args)
+        if args.command == "answer":
+            return asyncio.run(cmd_answer(args))
+        if args.command == "judge":
+            return asyncio.run(cmd_judge(args))
+        if args.command == "capability":
+            return asyncio.run(cmd_capability(args))
+        if args.command == "report":
+            return cmd_report(args)
+        if args.command == "run":
+            return asyncio.run(cmd_run(args))
+        return asyncio.run(run_legacy(args))
+    except (ConfigError, SpecError) as error:
+        logger.error("%s", error)
+        return 2
 
 
 if __name__ == "__main__":

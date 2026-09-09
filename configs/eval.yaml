@@ -1,0 +1,117 @@
+# Evaluation configuration for llm_persona_eval.
+#
+# Model assignment is a methodological decision, not a convenience. Three model families are
+# available, and each had a different relationship to the data the model under test was
+# trained on:
+#
+#   qwen3p8-max          GENERATED every training row. Never used here, for anything.
+#   deepseek-v4-pro      REVIEWED and filtered the training rows, so its taste is partly
+#                        baked into the adapter. Used to author the suite, and as the
+#                        SECOND judge only.
+#   kimi-k3              Touched nothing. `second_reviewer_role` was empty in every data
+#                        run, so it never saw a training row. It is the primary judge.
+#
+# The primary judge is therefore the one model with no stake in the training data. Scoring
+# the same answers with both judges also measures the bias directly: if deepseek scores the
+# adapter higher than kimi does, that gap is the curator's thumb on the scale.
+#
+# Loaded with an absolute path and repo_root=<data pipeline>, so targets/, pricing and the
+# Fireworks key resolve against the pipeline checkout.
+
+targets_dir: targets
+runs_dir: runs
+pricing_file: configs/pricing.yaml
+
+evaluation:
+  # Same settings for every arm. The report checks this held.
+  temperature: 0.7
+  top_p: 0.95
+  answer_max_tokens: 1000
+  seed: 13
+
+models:
+  # -- authoring the suite ------------------------------------------------------------
+  # Situations need variety: near-duplication was the failure mode of the last data run,
+  # so this role runs hot. Rubrics need precision, so they get their own cold role.
+  author_situations:
+    model: accounts/fireworks/models/deepseek-v4-pro-0813
+    base_url: https://api.fireworks.ai/inference/v1
+    api_key_source: fireworks
+    max_concurrency: 4
+    temperature: 0.9
+    max_tokens: 16000
+    timeout_s: 600
+
+  author_rubric:
+    model: accounts/fireworks/models/deepseek-v4-pro-0813
+    base_url: https://api.fireworks.ai/inference/v1
+    api_key_source: fireworks
+    max_concurrency: 4
+    temperature: 0.2
+    max_tokens: 16000
+    timeout_s: 600
+
+  # The authoring module asks for one role by this name for both stages. It runs warm rather
+  # than cold because near-duplication, not imprecision, is this specification's known failure
+  # mode: the last data run threw away 188 of 479 responses as near-duplicates. Rubric
+  # precision is defended instead by schema validation, the repair loop and the rubric audit,
+  # none of which depend on a low sampling temperature.
+  generator:
+    model: accounts/fireworks/models/deepseek-v4-pro-0813
+    base_url: https://api.fireworks.ai/inference/v1
+    api_key_source: fireworks
+    max_concurrency: 4
+    temperature: 0.8
+    max_tokens: 16000
+    timeout_s: 600
+
+  # -- grading ------------------------------------------------------------------------
+  # Primary judge: the family with no contact with the training data.
+  judge:
+    model: accounts/fireworks/models/kimi-k3
+    base_url: https://api.fireworks.ai/inference/v1
+    api_key_source: fireworks
+    max_concurrency: 4
+    temperature: 0.0
+    max_tokens: 12000
+    timeout_s: 600
+
+  # Second judge, for agreement and for the curator-bias audit described above.
+  judge_second:
+    model: accounts/fireworks/models/deepseek-v4-pro-0813
+    base_url: https://api.fireworks.ai/inference/v1
+    api_key_source: fireworks
+    max_concurrency: 4
+    temperature: 0.0
+    max_tokens: 12000
+    timeout_s: 600
+
+  embeddings:
+    model: accounts/fireworks/models/qwen3-embedding-8b
+    base_url: https://api.fireworks.ai/inference/v1
+    api_key_source: fireworks
+    max_concurrency: 2
+
+  # -- the two arms under test --------------------------------------------------------
+  # Both are the same Q4_K_M base file served by llama.cpp; the adapter server applies the
+  # LoRA at runtime. Identical settings, identical quantisation, different port: the only
+  # difference between the arms is the adapter.
+  base:
+    model: qwen2.5-7b-instruct
+    base_url: http://127.0.0.1:8080/v1
+    api_key_source: none
+    max_concurrency: 4
+    temperature: 0.7
+    max_tokens: 1000
+    timeout_s: 900
+    supports_json_mode: false
+
+  adapter:
+    model: qwen2.5-7b-instruct
+    base_url: http://127.0.0.1:8081/v1
+    api_key_source: none
+    max_concurrency: 4
+    temperature: 0.7
+    max_tokens: 1000
+    timeout_s: 900
+    supports_json_mode: false
