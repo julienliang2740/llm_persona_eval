@@ -106,11 +106,13 @@ SMALL_N = 20
 #: the arm that a reader could act on.
 MIN_CELL_N = 5
 
-#: A format premium at or above this size, on the 0-2 scale, is called material and printed
-#: beside the reasoning comparison. Same convention and same reasoning as MATERIAL_DID: it is
-#: the point at which the shape alone explains enough of a gain to change what a reader
-#: concludes from it.
-MATERIAL_PREMIUM = 0.15
+#: The bar at which any of the three contamination audits is called material, on the 0-2 scale.
+#: One number rather than three because they answer the same question in different places: how
+#: much of a reported gain is explained by something other than the model's judgment. It is a
+#: reporting convention, roughly 7.5% of the scale, and not derived from the data.
+MATERIAL_DELTA = 0.15
+MATERIAL_PREMIUM = MATERIAL_DELTA
+MATERIAL_AUTHOR_EFFECT = MATERIAL_DELTA
 
 #: Note prefixes the judging module writes onto an unscorable DimensionScore. Mirrored here
 #: rather than imported so the report does not depend on the run package, which pulls in a
@@ -118,11 +120,11 @@ MATERIAL_PREMIUM = 0.15
 JUDGING_FAILURE_PREFIX = "judging_failure:"
 INAPPLICABLE_PREFIX = "inapplicable:"
 
-#: A difference-of-differences between two judges at or above this size, on the 0-2 scale, is
-#: called material in the report. Also a convention: it is 7.5% of the scale, and roughly the
-#: size at which a judge's preference would move a headline mean by enough to change which arm
-#: a reader would pick. It is not a significance threshold and is not derived from the data.
-MATERIAL_DID = 0.15
+MATERIAL_DID = MATERIAL_DELTA
+
+#: What a score was graded against. Mirrors persona_eval.suite.rival; "unknown" is a defect
+#: rather than a third standard, and is kept out of every population.
+STANDARD_ORIGINAL, STANDARD_RIVAL = "original", "rival"
 
 #: Keys that may carry a completion-token count in CaseResult.answer_meta. The running team
 #: owns that dict, so every key is tried and a word count is the documented fallback.
@@ -726,6 +728,72 @@ class JudgeDivergence:
 
 
 @dataclass(frozen=True)
+class RubricDivergence:
+    """How far the rival standard's rubrics fell from the originals.
+
+    This is not the author effect. It bounds how much signal the author-effect comparison can
+    carry: if the rival wrote nearly the same rubric, a small difference between the two
+    estimates means the two models agreed, not that the authoring was clean.
+    """
+
+    cases: int
+    minimum: float | None
+    median: float | None
+    maximum: float | None
+    mean: float | None
+    identical: int
+    below_threshold: int
+    threshold: float | None
+
+    @property
+    def degenerate(self) -> bool:
+        """The rival is too close to the original for the comparison to mean anything."""
+        if not self.cases:
+            return True
+        if self.identical >= self.cases:
+            return True
+        return self.below_threshold >= self.cases
+
+
+@dataclass(frozen=True)
+class AuthorEffect:
+    """The arms' gap under the suite's own standard against the same gap under a rival one.
+
+    The two-judge audit measures judge contamination and is structurally blind to author
+    contamination, which is larger here: one model wrote every situation, rubric and anchor,
+    and both judges read the same rubric, so that taste cancels out of their comparison by
+    construction. Grading the same answers against an independently written standard is the
+    only thing in the run that can see it.
+
+    `shrinkage` is gap under the original minus gap under the rival. Positive means the gap is
+    smaller when someone else wrote the standard, and that difference is the part of the
+    reported result the standard was supplying rather than the model.
+    """
+
+    group: str
+    baseline_arm: str
+    arm: str
+    cases: int
+    families: int
+    baseline_original: float | None
+    arm_original: float | None
+    baseline_rival: float | None
+    arm_rival: float | None
+    gap_original: float | None
+    gap_rival: float | None
+    shrinkage: float | None
+    narrower_under_rival: int
+    wider_under_rival: int
+    level: int
+    p_value: float | None
+    small_sample: bool
+
+    @property
+    def material(self) -> bool:
+        return self.shrinkage is not None and self.shrinkage >= MATERIAL_AUTHOR_EFFECT
+
+
+@dataclass(frozen=True)
 class Analysis:
     """Everything the report shows. Deliberately has no single overall score field."""
 
@@ -751,6 +819,10 @@ class Analysis:
     integrity: tuple[IntegrityStat, ...] = ()
     pairing_losses: tuple[PairingLoss, ...] = ()
     format_premium: tuple[FormatPremium, ...] = ()
+    author_effect: tuple[AuthorEffect, ...] = ()
+    rubric_divergence: RubricDivergence | None = None
+    rival_cases: int = 0
+    rival_families: int = 0
     family_counts: tuple[FamilyCount, ...] = ()
     verbosity: tuple[VerbosityAudit, ...] = ()
     position: tuple[PositionAudit, ...] = ()
@@ -958,6 +1030,73 @@ def _split_passes(
             f"reliability section and are excluded from every score, rate and comparison."
         )
     return primary, repeats
+
+
+def _split_standards(
+    results: Sequence[CaseResult], notes: list[str]
+) -> tuple[list[CaseResult], list[CaseResult]]:
+    """(graded against the suite's own rubric, graded against a rival one).
+
+    Keyed on CaseResult.standard rather than on which file a row came from, so a merged file or
+    a mislabelled directory cannot pool a rival-graded score into a per-dimension mean beside
+    the originals. Anything that is neither is a defect rather than a third standard, and is
+    kept out of both populations.
+    """
+    original: list[CaseResult] = []
+    rival: list[CaseResult] = []
+    other: Counter[str] = Counter()
+    for result in results:
+        standard = str(getattr(result, "standard", "") or STANDARD_ORIGINAL).strip().lower()
+        if standard in ("", STANDARD_ORIGINAL):
+            original.append(result)
+        elif standard == STANDARD_RIVAL:
+            rival.append(result)
+        else:
+            other[standard] += 1
+    if other:
+        notes.append(
+            "Results name a standard that is neither original nor rival ("
+            + ", ".join(f"{name} x{count}" for name, count in other.most_common(4))
+            + "). They are excluded from every table; a third standard is a defect, not a "
+            "population."
+        )
+    if rival:
+        notes.append(
+            f"{len(rival)} result(s) were graded against a rival standard. They are used only by "
+            f"the author-effect section and never enter a per-dimension mean beside the originals."
+        )
+    return original, rival
+
+
+def _phantom_arm_note(arms: Sequence[str], notes: list[str]) -> None:
+    """Catch an arm that is another arm with a standard prefix glued on.
+
+    A result loader that globs `results_*.jsonl` across a directory holding
+    `results_rival_base.jsonl` returns an arm called `rival_base`, and the report would then
+    show the same model twice, once as a fiction. Keying on `standard` prevents the pooling;
+    this catches the naming so the fiction is visible rather than plausible.
+    """
+    lowered = {arm.lower() for arm in arms}
+    suspects = [
+        arm
+        for arm in arms
+        for prefix in ("rival_", "recast_")
+        if arm.lower().startswith(prefix) and arm.lower()[len(prefix) :] in lowered
+    ]
+    suspects += [
+        arm
+        for arm in arms
+        for suffix in ("_recast", "_rival")
+        if arm.lower().endswith(suffix) and arm.lower()[: -len(suffix)] in lowered
+    ]
+    if suspects:
+        notes.append(
+            "Arm name(s) "
+            + ", ".join(sorted(set(suspects)))
+            + " look like another arm with a standard prefix or suffix attached, which is what a "
+            "result loader produces when it globs a directory holding a second standard's files. "
+            "Check that these are real arms before reading anything into them."
+        )
 
 
 def _split_verdicts(
@@ -2067,6 +2206,121 @@ def _deterministic_errors(result: CaseResult) -> int:
     checks = payload.get("checks")
     entries = checks if isinstance(checks, (list, tuple)) else payload.values()
     return sum(1 for entry in entries if isinstance(entry, Mapping) and entry.get("error"))
+
+
+def _rubric_divergence(rival_report: Mapping[str, Any] | None) -> RubricDivergence | None:
+    """The rival report's own divergence summary, read defensively."""
+    if not isinstance(rival_report, Mapping):
+        return None
+    summary = rival_report.get("divergence_summary")
+    if not isinstance(summary, Mapping):
+        return None
+
+    def number(key: str) -> float | None:
+        value = summary.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    return RubricDivergence(
+        cases=_as_count(summary.get("cases")),
+        minimum=number("min"),
+        median=number("median"),
+        maximum=number("max"),
+        mean=number("mean"),
+        identical=_as_count(summary.get("identical")),
+        below_threshold=_as_count(summary.get("below_low_divergence")),
+        threshold=number("low_divergence_threshold"),
+    )
+
+
+def _author_effect(
+    primary: Sequence[CaseResult],
+    rival: Sequence[CaseResult],
+    arms: Sequence[str],
+    baseline_arm: str | None,
+    notes: list[str],
+) -> tuple[AuthorEffect, ...]:
+    """The arms' gap under each standard, over the cases that carry both.
+
+    Every figure needs four scores for one case: each arm under each standard. Requiring all
+    four is what makes the two gaps comparable, since anything about the case itself, or about
+    either arm's answer to it, is common to both sides and cancels.
+    """
+    if not baseline_arm or not rival:
+        return ()
+    rival_primary = [r for r in rival if _pass_index(r) == 0 and is_graded(r)]
+    index: dict[tuple[str, str, str], dict[str, int]] = {}
+    family_of: dict[str, str] = {}
+    for standard, rows in ((STANDARD_ORIGINAL, primary), (STANDARD_RIVAL, rival_primary)):
+        for result in rows:
+            if not is_graded(result):
+                continue
+            key = (standard, result.arm, result.case_id)
+            if key in index:
+                continue
+            scores = _scored_map(result)
+            if scores:
+                index[key] = scores
+                family_of.setdefault(result.case_id, result.family_id)
+
+    case_ids = sorted({case for (_standard, _arm, case) in index})
+    out: list[AuthorEffect] = []
+    for arm in arms:
+        if arm == baseline_arm:
+            continue
+        for group in ("action", "reasoning"):
+            rows: list[tuple[str, str, float, float, float, float]] = []
+            for case_id in case_ids:
+                cells: list[float] = []
+                for standard in (STANDARD_ORIGINAL, STANDARD_RIVAL):
+                    for which in (baseline_arm, arm):
+                        scores = index.get((standard, which, case_id))
+                        value = None if scores is None else _group_mean_of(scores, group)[0]
+                        if value is None:
+                            break
+                        cells.append(value)
+                    else:
+                        continue
+                    break
+                if len(cells) == 4:
+                    rows.append(
+                        (case_id, family_of.get(case_id, ""), cells[0], cells[1], cells[2], cells[3])
+                    )
+            if not rows:
+                continue
+            per_case = [(row[3] - row[2]) - (row[5] - row[4]) for row in rows]
+            narrower = sum(1 for value in per_case if value > 1e-9)
+            wider = sum(1 for value in per_case if value < -1e-9)
+            gap_original = _mean([row[3] - row[2] for row in rows])
+            gap_rival = _mean([row[5] - row[4] for row in rows])
+            out.append(
+                AuthorEffect(
+                    group=group,
+                    baseline_arm=baseline_arm,
+                    arm=arm,
+                    cases=len(rows),
+                    families=len({row[1] for row in rows if row[1]}),
+                    baseline_original=_mean([row[2] for row in rows]),
+                    arm_original=_mean([row[3] for row in rows]),
+                    baseline_rival=_mean([row[4] for row in rows]),
+                    arm_rival=_mean([row[5] for row in rows]),
+                    gap_original=gap_original,
+                    gap_rival=gap_rival,
+                    shrinkage=_mean(per_case),
+                    narrower_under_rival=narrower,
+                    wider_under_rival=wider,
+                    level=len(per_case) - narrower - wider,
+                    p_value=sign_test_p(narrower, wider),
+                    small_sample=len(rows) < SMALL_N,
+                )
+            )
+    if rival_primary and not out:
+        notes.append(
+            "Rival-graded results exist but no case carries all four scores needed to compare "
+            "the two standards, so the author effect could not be computed."
+        )
+    return tuple(out)
 
 
 def _integrity(primary: Sequence[CaseResult], arms: Sequence[str]) -> tuple[IntegrityStat, ...]:

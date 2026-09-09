@@ -1286,7 +1286,11 @@ def _reliability(analysis: Analysis) -> list[str]:
         )
     lines += _truncation_warning(analysis)
     lines += _imbalance_warning(analysis)
-    losses = [stat for stat in analysis.integrity if stat.judging_failures or stat.inapplicable_dimensions]
+    losses = [
+        stat
+        for stat in analysis.integrity
+        if stat.judging_failures or stat.inapplicable_dimensions or stat.dropped_rubric_flags
+    ]
     if losses:
         lines += [
             "",
@@ -1294,14 +1298,36 @@ def _reliability(analysis: Analysis) -> list[str]:
             "task cannot express is correctly not scored; a dimension the grading lost is a "
             "hole in the measurement, and only the second should worry a reader.",
             "",
-            "| arm | lost to a grading problem | correctly inapplicable | checks that could not run |",
-            "|---|---|---|---|",
+            "| arm | lost to a grading problem | correctly inapplicable "
+            "| judge flags matching no rubric item | checks that could not run |",
+            "|---|---|---|---|---|",
         ]
         for stat in losses:
             lines.append(
                 f"| `{stat.arm}` | **{stat.judging_failures}** | {stat.inapplicable_dimensions} "
-                f"| {stat.deterministic_errors} |"
+                f"| {stat.dropped_rubric_flags} | {stat.deterministic_errors} |"
             )
+        reasons = [
+            (stat.arm, reason, count)
+            for stat in analysis.integrity
+            for reason, count in stat.judging_failure_reasons
+        ]
+        if reasons:
+            lines += ["", "Why the grading lost them:", ""]
+            for arm, reason, count in reasons[:10]:
+                lines.append(f"- `{arm}`: {_truncate(reason, 140)} (x{count})")
+        flagged = [stat for stat in analysis.integrity if stat.dropped_rubric_flags]
+        if flagged:
+            lines += [
+                "",
+                "A judge flag matching no rubric item is a flag the judge raised against "
+                "something the rubric never listed. It leaves no score behind at all, so it is "
+                "invisible in every table above and is counted here instead.",
+                "",
+            ]
+            for stat in flagged:
+                for example in stat.dropped_flag_examples[:4]:
+                    lines.append(f"- `{stat.arm}`: {_truncate(example, 160)}")
         lost = sum(stat.judging_failures for stat in analysis.integrity)
         if lost:
             lines += [

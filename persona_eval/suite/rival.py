@@ -539,10 +539,13 @@ ORIGINAL, RIVAL, UNKNOWN = "original", "rival", "unknown"
 def standard_labels(report: dict[str, Any]) -> dict[str, dict[str, str]]:
     """{case_id: {rubric_version: "original" | "rival"}}, from a rival report.
 
-    A CaseResult records `rubric_version` but nothing naming which standard produced it, so
-    scores graded against two different standards would otherwise pool into one mean in
-    silence. That is the worst available failure: it would not error, it would not look odd,
-    and it would quietly average a measurement with its own control.
+    The third and cheapest of three agreeing mechanisms, and the one that survives the other
+    two. A result carries `CaseResult.standard`, and the rival command writes its results into
+    their own directory, so a row is normally labelled twice over. This recovers the label
+    from `rubric_version` alone, for a row detached from both: an older result written before
+    that field existed, or a set pooled from several runs. Pooling the two standards into one
+    mean is the worst available failure, because it would not error and would not look odd
+    while averaging a measurement with its own control.
 
     Keyed by case first because a rival rubric that came back word for word identical shares
     its original's version hash. Same version, same case, same score, so the label is

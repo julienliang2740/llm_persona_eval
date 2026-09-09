@@ -1781,3 +1781,166 @@ def test_a_malformed_plan_key_does_not_break_the_report() -> None:
         text = render_report(analysis, suite, {})
         assert "**Planned and lost.**" not in text
         assert "### Dimension coverage" in text
+
+
+# ------------------------------------------------- the judging record and its own accessor
+
+
+def test_the_judging_record_is_preferred_over_the_note_prefixes(basic_suite: Suite) -> None:
+    """It counts things the notes cannot: a judge flag matching no rubric item leaves no score."""
+    case = basic_suite.case("fam_work.decide.original")
+    result = make_result(case, "base", {"action_judgment": 2})
+    result.answer_meta = {
+        "judging": {
+            "dimensions_scored": 1,
+            "dimensions_failed": 3,
+            "dimensions_inapplicable": 2,
+            "dropped_rubric_flags": 4,
+            "dropped_rubric_flag_examples": ["invented a duty of deference"],
+            "by_reason": {"quote not found in the answer": 3},
+            "unrecognised_unscorable_field": True,
+        }
+    }
+    analysis = analyse(basic_suite, [result])
+    stat = next(s for s in analysis.integrity if s.arm == "base")
+    assert stat.judging_failures == 3
+    assert stat.inapplicable_dimensions == 2
+    assert stat.dropped_rubric_flags == 4
+    assert ("quote not found in the answer", 3) in stat.judging_failure_reasons
+    assert any("unrecognised" in reason for reason, _count in stat.judging_failure_reasons)
+    text = render_report(analysis, basic_suite, {})
+    assert "invented a duty of deference" in text
+
+
+def test_results_without_a_judging_record_fall_back_to_the_notes(basic_suite: Suite) -> None:
+    """Results written before that field existed must still be counted."""
+    case = basic_suite.case("fam_work.decide.original")
+    result = CaseResult(
+        case_id=case.case_id,
+        family_id=case.family_id,
+        task=case.task,
+        variant=case.variant,
+        arm="base",
+        model_id="m",
+        answer_text="an answer",
+        scores=[
+            DimensionScore("action_judgment", 2, quote="q"),
+            DimensionScore("prioritization", None, note="judging_failure: quote too short to verify"),
+            DimensionScore("reasoning_fidelity", None, note="inapplicable: the task cannot express it"),
+        ],
+        judge_model="kimi-k3",
+    )
+    analysis = analyse(basic_suite, [result])
+    stat = next(s for s in analysis.integrity if s.arm == "base")
+    assert (stat.judging_failures, stat.inapplicable_dimensions) == (1, 1)
+    assert stat.dropped_rubric_flags == 0
+
+
+# ------------------------------------------------------- the judging team's premium object
+
+
+class _FormPremiumLike:
+    """Stand-in for the judging module's FormPremium, duck-typed the way analyse reads it."""
+
+    def __init__(self, rows, **meta):
+        self.recast_rows = rows
+        for key, value in meta.items():
+            setattr(self, key, value)
+
+
+def test_the_premium_object_is_accepted_whole_with_its_trust_metadata(basic_suite: Suite) -> None:
+    cases = [
+        basic_suite.case("fam_work.decide.original"),
+        basic_suite.case("fam_work.decide.pressure"),
+        basic_suite.case("fam_far.decide.original"),
+    ]
+    results = [make_result(c, "base", {"reasoning_fidelity": 1}) for c in cases]
+    rows = [make_result(c, "base_recast", {"reasoning_fidelity": 2}) for c in cases]
+    for row in rows:
+        row.answer_meta = {"form_control_of": "base"}
+    premium_object = _FormPremiumLike(
+        rows,
+        n_attempted=20,
+        n_usable=3,
+        rejected={"position moved": 12, "rewriter declined": 5},
+        trustworthy=False,
+        median_length_ratio=1.6,
+    )
+    analysis = analyse(basic_suite, results, baseline_arm="base", form_control=premium_object)
+    premium = next(p for p in analysis.format_premium if p.group == "reasoning")
+    assert premium.attempted == 20 and premium.usable == 3
+    assert premium.survival_rate == pytest.approx(0.15)
+    assert premium.trustworthy is False
+    assert premium.median_length_ratio == pytest.approx(1.6)
+    assert premium.rejected[0] == ("position moved", 12)
+    text = render_report(analysis, basic_suite, {})
+    assert "3 of 20 attempted recasts were usable" in text
+    assert "position moved x12" in text
+    assert "marks this premium untrustworthy" in text
+    assert "Median length ratio" in text
+    assert "separates a verbosity effect from a form effect" in text
+
+
+def test_the_in_batch_baseline_is_preferred_so_the_two_numbers_agree(basic_suite: Suite) -> None:
+    """Using the judging module's own re-grade makes this report's premium equal theirs."""
+    case = basic_suite.case("fam_work.decide.original")
+    # The main run scored the source answer 0; the in-batch re-grade scored it 1.
+    results = [make_result(case, "base", {"reasoning_fidelity": 0})]
+    row = make_result(case, "base_recast", {"reasoning_fidelity": 2})
+    row.answer_meta = {
+        "form_control_of": "base",
+        "form_control_baseline_scores": {"reasoning_fidelity": 1},
+    }
+    analysis = analyse(basic_suite, results, baseline_arm="base", form_control=[row])
+    premium = next(p for p in analysis.format_premium if p.group == "reasoning")
+    # 2 - 1 from the in-batch baseline, not 2 - 0 from the main run.
+    assert premium.premium == pytest.approx(1.0)
+    assert premium.source_mean == pytest.approx(1.0)
+    assert premium.baseline_source == "in-batch re-grade"
+    text = render_report(analysis, basic_suite, {})
+    assert "re-graded in the same batch" in text
+
+
+def test_without_an_in_batch_baseline_the_main_run_scores_are_used_and_flagged(
+    basic_suite: Suite,
+) -> None:
+    case = basic_suite.case("fam_work.decide.original")
+    results = [make_result(case, "base", {"reasoning_fidelity": 0})]
+    row = make_result(case, "base_recast", {"reasoning_fidelity": 2})
+    row.answer_meta = {"form_control_of": "base"}
+    analysis = analyse(basic_suite, results, baseline_arm="base", form_control=[row])
+    premium = next(p for p in analysis.format_premium if p.group == "reasoning")
+    assert premium.premium == pytest.approx(2.0)
+    assert premium.baseline_source == "main-run scores"
+    text = render_report(analysis, basic_suite, {})
+    assert "may be drift between grading passes" in text
+
+
+def test_the_premium_sentence_is_printed_whichever_way_it_came_out(basic_suite: Suite) -> None:
+    """Its presence must not leak the result, or a reader learns to read the heading."""
+    case = basic_suite.case("fam_work.decide.original")
+    texts = {}
+    for label, recast_score in (("material", 2), ("immaterial", 1)):
+        results = [make_result(case, "base", {"reasoning_fidelity": 1})]
+        row = make_result(case, "base_recast", {"reasoning_fidelity": recast_score})
+        row.answer_meta = {"form_control_of": "base"}
+        analysis = analyse(basic_suite, results, baseline_arm="base", form_control=[row])
+        texts[label] = render_report(analysis, basic_suite, {})
+    for label, text in texts.items():
+        assert "**The shape alone is worth " in text, label
+        assert "both graded blind" in text, label
+    assert "clears the" in texts["material"]
+    assert "below the" in texts["immaterial"]
+    assert "weak evidence of absence" in texts["immaterial"]
+
+
+def test_the_two_noise_floors_are_reasoned_in_the_rendered_text(basic_suite: Suite) -> None:
+    """A reader who sees one floor will misread half the table, so both are spelled out."""
+    verdicts = [_consistency(f"fam{i}", "base", i < 6) for i in range(10)]
+    verdicts += [_verdict("famP", "paraphrase", "invariance", "base", True)]
+    analysis = analyse(basic_suite, [], verdicts)
+    text = render_report(analysis, basic_suite, {})
+    assert "The floor is the consistency rate itself" in text
+    assert "one minus the consistency rate" in text
+    assert "by changing its answer at random, having demonstrated nothing" in text
+    assert "only evidence if the arm stays put when they do not" in text
