@@ -345,6 +345,25 @@ def cmd_report(args: argparse.Namespace) -> int:
         verdicts += _load_verdicts(directory, arm)
         capability += runs.read_jsonl(runs.capability_path(directory, arm))
 
+    # Optional controls, each rendering as a stated missing control when absent. `is_dir` is
+    # deliberate rather than runs.rival_dir(): that helper creates the directory, and a
+    # read-only report must not leave an empty one behind that a later reader mistakes for a
+    # control that ran and found nothing.
+    rival_results: list[CaseResult] = []
+    rival_report: dict[str, Any] = {}
+    rival_root = directory / runs.RIVAL_DIR
+    if rival_root.is_dir():
+        for arm in runs.arms_present(rival_root):
+            rival_results += _load_results(rival_root, arm)
+        report_path = rival_root / "rival_report.json"
+        if report_path.is_file():
+            rival_report = runs.read_json(report_path)
+
+    premium_path = directory / "form_premium.json"
+    # The whole object, not its rows: the survival rate and the trust flag live on it, and a
+    # premium computed over four surviving pairs of twenty is not a premium.
+    form_control = runs.read_json(premium_path) if premium_path.is_file() else None
+
     analysis = analyse(
         suite,
         results,
@@ -352,6 +371,9 @@ def cmd_report(args: argparse.Namespace) -> int:
         capability=capability,
         baseline_arm=args.baseline if args.baseline in arms else arms[0],
         curator_judge=args.curator_judge,
+        form_control=form_control,
+        rival_results=rival_results,
+        rival_report=rival_report or None,
     )
     record = runs.read_record(directory)
     signatures = [
@@ -381,6 +403,11 @@ def cmd_report(args: argparse.Namespace) -> int:
         "spec_version": suite.spec_version,
         "config": str(config.path),
         "authoring": suite.authoring,
+        "controls": {
+            "form_premium": bool(form_control),
+            "rival_standard": bool(rival_results),
+            "rival_families": len(rival_report.get("rivalled_family_ids") or []) if rival_report else 0,
+        },
     }
     runs.write_json(directory / runs.ANALYSIS_FILE, analysis)
     text = render_report(analysis, suite, meta)

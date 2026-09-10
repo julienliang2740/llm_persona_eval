@@ -2029,6 +2029,12 @@ def test_a_gap_that_shrinks_under_a_rival_standard_is_the_author_effect(basic_su
     assert "## Author effect" in text
     assert "clears the 0.15 bar" in text
     assert "needs restating at the smaller figure" in text
+    # The X / Y / Z sentence the lead asked for, and the absolute levels beside it.
+    assert (
+        "Under the original standard the reasoning gap is +2.00; under an independently "
+        "written one it is +0.00, so the standard explains the whole of the measured advantage."
+    ) in text
+    assert "a harsher rival pulls both arms down together" in text
     assert "median **0.62**" in text
     # Both limits must be stated rather than left to the reader.
     assert "change expectations stay pinned" in text
@@ -2044,7 +2050,8 @@ def test_a_gap_that_survives_the_rival_standard_is_stated_as_such(basic_suite: S
     assert effect.material is False
     text = render_report(analysis, basic_suite, {})
     # Same sentence shape either way, so its presence cannot leak the result.
-    assert "**When someone else writes the standard, the gap changes by " in text
+    assert "Under the original standard the reasoning gap is +2.00; under an independently " in text
+    assert "so the standard explains none of the measured advantage." in text
     assert "not an artefact of who wrote the rubric" in text
 
 
@@ -2173,3 +2180,47 @@ def test_recast_rows_are_not_treated_as_an_arm(basic_suite: Suite) -> None:
     assert analysis.stat("base_recast", "reasoning_fidelity") is None
     text = render_report(analysis, basic_suite, {})
     assert "| `base_recast` |" not in text.split("## Format premium")[0]
+
+
+def test_the_share_sentence_composes_in_every_case_the_data_can_produce(basic_suite: Suite) -> None:
+    """Zero gaps and gaps that widen under the rival are not percentages of anything."""
+    from persona_eval.report.render import _share_clause
+
+    assert _share_clause(1.0, 2.0) == "explains about 50% of the measured advantage"
+    assert _share_clause(2.0, 2.0) == "explains the whole of the measured advantage"
+    assert _share_clause(0.0, 2.0) == "explains none of the measured advantage"
+    assert "wider under the rival" in _share_clause(-0.5, 2.0)
+    assert "no measured advantage to explain" in _share_clause(0.0, 0.0)
+    assert "unmeasurable" in _share_clause(None, 1.0)
+    # None of them leaves a dangling fragment when the sentence closes on it.
+    for part, whole in ((1.0, 2.0), (2.0, 2.0), (0.0, 2.0), (-0.5, 2.0), (0.0, 0.0), (None, 1.0)):
+        clause = _share_clause(part, whole)
+        assert not clause.endswith(" of")
+        assert clause.startswith(("explains", "has"))
+
+
+def test_a_harsher_rival_rubric_does_not_read_as_an_author_effect(basic_suite: Suite) -> None:
+    """Both arms drop together under a stricter standard; the gap is what survives."""
+    cases = [
+        basic_suite.case("fam_work.decide.original"),
+        basic_suite.case("fam_work.decide.pressure"),
+        basic_suite.case("fam_far.decide.original"),
+    ]
+    results = []
+    for case in cases:
+        results.append(make_result(case, "base", {"reasoning_fidelity": 2}))
+        results.append(make_result(case, "adapter", {"reasoning_fidelity": 2}))
+        # The rival marks everything a point lower, but marks both arms the same way.
+        results.append(_rival(make_result(case, "base", {"reasoning_fidelity": 1})))
+        results.append(_rival(make_result(case, "adapter", {"reasoning_fidelity": 1})))
+    analysis = analyse(basic_suite, results, baseline_arm="base")
+    effect = next(e for e in analysis.author_effect if e.group == "reasoning")
+    assert effect.baseline_original == pytest.approx(2.0)
+    assert effect.baseline_rival == pytest.approx(1.0)  # the level moved
+    assert effect.gap_original == pytest.approx(0.0)
+    assert effect.gap_rival == pytest.approx(0.0)  # the gap did not
+    assert effect.shrinkage == pytest.approx(0.0)
+    assert effect.material is False
+    text = render_report(analysis, basic_suite, {})
+    assert "no measured advantage to explain" in text
+    assert "a harsher rival pulls both arms down together" in text

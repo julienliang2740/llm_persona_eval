@@ -1,0 +1,113 @@
+{
+  "run_id": "20260910-003107",
+  "suite": "suites/confucian-v1.json",
+  "suite_version": "1fbb2b050d8f",
+  "target": "confucian",
+  "arms": [
+    "base",
+    "adapter"
+  ],
+  "config": "/home/ubuntu/llm_persona/llm_persona_eval/configs/eval.yaml",
+  "started_utc": "2026-09-10T00:31:07Z",
+  "updated_utc": "2026-09-10T01:10:59Z",
+  "stages": {
+    "answer_base": {
+      "n": 70,
+      "settings": {
+        "role": "base",
+        "model": "qwen2.5-7b-instruct",
+        "base_url": "http://127.0.0.1:8080/v1",
+        "temperature": 0.7,
+        "max_tokens": 1000,
+        "top_p": 0.95,
+        "seed": 13,
+        "system_prompt": null,
+        "max_tokens_source": "config"
+      },
+      "disagreements": [
+        "5c542d7b687d"
+      ],
+      "finished_utc": "2026-09-10T01:08:28Z"
+    },
+    "capability_base": {
+      "arm": "base",
+      "total": {
+        "n": 40,
+        "passed": 36,
+        "technical_failures": 0,
+        "pass_rate": 0.9
+      },
+      "by_family": {
+        "instruction_following": {
+          "n": 22,
+          "passed": 18,
+          "technical_failures": 0,
+          "pass_rate": 0.818
+        },
+        "math": {
+          "n": 13,
+          "passed": 13,
+          "technical_failures": 0,
+          "pass_rate": 1.0
+        },
+        "coding": {
+          "n": 5,
+          "passed": 5,
+          "technical_failures": 0,
+          "pass_rate": 1.0
+        }
+      },
+      "by_tag": {
+        "format": {
+          "n": 14,
+          "passed": 13,
+          "technical_failures": 0,
+          "pass_rate": 0.929
+        },
+        "length": {
+          "n": 11,
+          "passed": 8,
+          "technical_failures": 0,
+          "pass_rate": 0.727
+        },
+        "forbidden": {
+          "n": 7,
+          "passed": 5,
+          "technical_failures": 0,
+          "pass_rate": 0.714
+        },
+        "literal": {
+          "n": 4,
+          "passed": 2,
+          "technical_failures": 0,
+          "pass_rate": 0.5
+        },
+        "moral_pull": {
+          "n": 6,
+          "passed": 6,
+          "technical_failures": 0,
+          "pass_rate": 1.0
+        },
+        "arithmetic": {
+          "n": 4,
+          "passed": 4,
+          "technical_failures": 0,
+          "pass_rate": 1.0
+        },
+        "word_problem": {
+          "n": 9,
+          "passed": 9,
+          "technical_failures": 0,
+          "pass_rate": 1.0
+        },
+        "function": {
+          "n": 5,
+          "passed": 5,
+          "technical_failures": 0,
+          "pass_rate": 1.0
+        }
+      },
+      "finished_utc": "2026-09-10T01:10:59Z"
+    }
+  }
+}

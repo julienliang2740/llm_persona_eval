@@ -1711,29 +1711,44 @@ def _author_effect_section(analysis: Analysis) -> list[str]:
         f"Restricted to the {_plural(sample.cases, 'case')} carrying all four scores: each arm "
         f"under each standard. The gap is `{sample.arm}` minus `{sample.baseline_arm}`.",
         "",
-        "| group | gap under the original | gap under the rival | difference | narrower under "
-        "rival | wider | level | cases | families | sign test |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        f"| group | `{sample.baseline_arm}` original | `{sample.arm}` original | gap "
+        f"| `{sample.baseline_arm}` rival | `{sample.arm}` rival | gap | difference "
+        "| narrower under rival | wider | level | cases | families | sign test |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for effect in analysis.author_effect:
         lines.append(
-            f"| {effect.group} | {_signed(effect.gap_original)} | {_signed(effect.gap_rival)} "
+            f"| {effect.group} | {_num(effect.baseline_original)} | {_num(effect.arm_original)} "
+            f"| {_signed(effect.gap_original)} | {_num(effect.baseline_rival)} "
+            f"| {_num(effect.arm_rival)} | {_signed(effect.gap_rival)} "
             f"| **{_signed(effect.shrinkage)}** | {effect.narrower_under_rival} "
             f"| {effect.wider_under_rival} | {effect.level} "
             f"| {effect.cases}{' (small)' if effect.small_sample else ''} | {effect.families} "
             f"| {_p(effect.p_value)} |"
         )
-
-    detail = "; ".join(
-        f"{_signed(effect.shrinkage)} on {effect.group}" for effect in analysis.author_effect
-    )
-    material = [effect for effect in analysis.author_effect if effect.material]
     lines += [
         "",
-        f"**When someone else writes the standard, the gap changes by {detail}** on the 0-2 "
-        f"scale.",
-        "",
+        "The absolute columns are shown so the comparison can be audited, but they are not the "
+        "result. Two models writing two rubrics will differ in severity, and a harsher rival "
+        "pulls both arms down together without touching what separates them. The gap is what "
+        "survives that, which is why the comparison is between the two gaps and not between the "
+        "two score levels.",
     ]
+
+    material = [effect for effect in analysis.author_effect if effect.material]
+    lines.append("")
+    # One sentence per group, in the same shape whichever way the number falls. A section whose
+    # wording changes with the result teaches a reader to read the heading instead of the number.
+    for effect in analysis.author_effect:
+        lines.append(
+            f"**Under the original standard the {effect.group} gap is "
+            f"{_signed(effect.gap_original)}; under an independently written one it is "
+            f"{_signed(effect.gap_rival)}, so the standard "
+            f"{_share_clause(effect.shrinkage, effect.gap_original)}.** "
+            f"Over {_plural(effect.cases, 'case')} from "
+            f"{_plural(effect.families, 'family', 'families')}."
+        )
+        lines.append("")
     if material:
         groups = ", ".join(effect.group for effect in material)
         lines.append(
@@ -1763,6 +1778,26 @@ def _author_effect_section(analysis: Analysis) -> list[str]:
         f"table in this report and the marked rates should be read accordingly.",
     ]
     return lines
+
+
+def _share_clause(part: float | None, whole: float | None) -> str:
+    """The whole predicate, not a fragment, so it composes in every case the data can produce.
+
+    A gap of zero has no advantage to explain, and a gap that widens under the rival is not a
+    negative share of anything. Both need their own wording rather than a percentage.
+    """
+    if part is None or whole is None:
+        return "explains an unmeasurable share of the measured advantage"
+    if whole <= 1e-9:
+        return "has no measured advantage to explain, the arms being level under the original"
+    ratio = part / whole
+    if ratio < 0:
+        return "explains none of the measured advantage, the gap being wider under the rival"
+    if ratio <= 1e-9:
+        return "explains none of the measured advantage"
+    if ratio >= 1.0:
+        return "explains the whole of the measured advantage"
+    return f"explains about {ratio:.0%} of the measured advantage"
 
 
 def _divergence_note(analysis: Analysis) -> list[str]:
