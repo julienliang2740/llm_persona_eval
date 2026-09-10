@@ -385,9 +385,20 @@ def cmd_report(args: argparse.Namespace) -> int:
     # The record says what the run intended; the answers say what it did. `settings_disagreement`
     # reads the fingerprint stamped on each answer, so it catches a run whose record and
     # behaviour parted company. Both are reported; either one failing invalidates a comparison.
+    # `settings_disagreement` returns the distinct fingerprints it saw, not a list of
+    # problems: one fingerprint means every answer was produced the same way. More than one
+    # WITHIN an arm means that arm is internally inconsistent; more than one ACROSS arms
+    # means the comparison is between differently-sampled models. Treating any non-empty
+    # return as a fault made a correctly matched run report itself as incomparable.
     observed: list[str] = []
+    fingerprints: set[str] = set()
     for arm in arms:
-        observed += [f"{arm}: {problem}" for problem in settings_disagreement(runs.read_jsonl(runs.answers_path(directory, arm)))]
+        seen = settings_disagreement(runs.read_jsonl(runs.answers_path(directory, arm)))
+        fingerprints.update(seen)
+        if len(seen) > 1:
+            observed.append(f"{arm} answered under {len(seen)} different settings: {', '.join(seen)}")
+    if len(fingerprints) > 1:
+        observed.append(f"arms did not share one settings fingerprint: {', '.join(sorted(fingerprints))}")
     if observed:
         matched = False
         mismatches = mismatches + observed

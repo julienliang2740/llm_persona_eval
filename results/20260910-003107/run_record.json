@@ -9,7 +9,7 @@
   ],
   "config": "/home/ubuntu/llm_persona/llm_persona_eval/configs/eval.yaml",
   "started_utc": "2026-09-10T00:31:07Z",
-  "updated_utc": "2026-09-10T01:10:59Z",
+  "updated_utc": "2026-09-10T04:34:42Z",
   "stages": {
     "answer_base": {
       "n": 70,
@@ -108,6 +108,136 @@
         }
       },
       "finished_utc": "2026-09-10T01:10:59Z"
+    },
+    "answer_adapter": {
+      "n": 70,
+      "settings": {
+        "role": "adapter",
+        "model": "qwen2.5-7b-instruct",
+        "base_url": "http://127.0.0.1:8081/v1",
+        "temperature": 0.7,
+        "max_tokens": 1000,
+        "top_p": 0.95,
+        "seed": 13,
+        "system_prompt": null,
+        "max_tokens_source": "config"
+      },
+      "disagreements": [
+        "5c542d7b687d"
+      ],
+      "finished_utc": "2026-09-10T01:55:21Z"
+    },
+    "capability_adapter": {
+      "arm": "adapter",
+      "total": {
+        "n": 40,
+        "passed": 34,
+        "technical_failures": 0,
+        "pass_rate": 0.85
+      },
+      "by_family": {
+        "instruction_following": {
+          "n": 22,
+          "passed": 16,
+          "technical_failures": 0,
+          "pass_rate": 0.727
+        },
+        "math": {
+          "n": 13,
+          "passed": 13,
+          "technical_failures": 0,
+          "pass_rate": 1.0
+        },
+        "coding": {
+          "n": 5,
+          "passed": 5,
+          "technical_failures": 0,
+          "pass_rate": 1.0
+        }
+      },
+      "by_tag": {
+        "format": {
+          "n": 14,
+          "passed": 13,
+          "technical_failures": 0,
+          "pass_rate": 0.929
+        },
+        "length": {
+          "n": 11,
+          "passed": 5,
+          "technical_failures": 0,
+          "pass_rate": 0.455
+        },
+        "forbidden": {
+          "n": 7,
+          "passed": 4,
+          "technical_failures": 0,
+          "pass_rate": 0.571
+        },
+        "literal": {
+          "n": 4,
+          "passed": 3,
+          "technical_failures": 0,
+          "pass_rate": 0.75
+        },
+        "moral_pull": {
+          "n": 6,
+          "passed": 4,
+          "technical_failures": 0,
+          "pass_rate": 0.667
+        },
+        "arithmetic": {
+          "n": 4,
+          "passed": 4,
+          "technical_failures": 0,
+          "pass_rate": 1.0
+        },
+        "word_problem": {
+          "n": 9,
+          "passed": 9,
+          "technical_failures": 0,
+          "pass_rate": 1.0
+        },
+        "function": {
+          "n": 5,
+          "passed": 5,
+          "technical_failures": 0,
+          "pass_rate": 1.0
+        }
+      },
+      "finished_utc": "2026-09-10T01:58:18Z"
+    },
+    "judge_base": {
+      "results": 82,
+      "verdicts": 32,
+      "finished_utc": "2026-09-10T02:35:03Z"
+    },
+    "judge_adapter": {
+      "results": 82,
+      "verdicts": 32,
+      "finished_utc": "2026-09-10T03:31:28Z"
+    },
+    "report": {
+      "arms": [
+        "adapter",
+        "base"
+      ],
+      "settings_matched": true,
+      "finished_utc": "2026-09-10T04:34:42Z"
+    },
+    "form_control": {
+      "arm": "base",
+      "n": 20,
+      "finished_utc": "2026-09-10T03:51:31Z"
+    },
+    "rival": {
+      "families": 5,
+      "cases": 14,
+      "rejudged": {
+        "adapter": 14,
+        "base": 14
+      },
+      "finished_utc": "2026-09-10T04:26:34Z"
     }
   }
 }
